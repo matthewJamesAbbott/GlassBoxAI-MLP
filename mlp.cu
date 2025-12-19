@@ -1,5 +1,5 @@
 //
-// Matthew Abbott 19/3/2023
+// Matthew Abbott 2025
 // CUDA Port of MLP with CLI interface
 // Enhanced with: Softmax, Adam/RMSProp optimizers, Dropout, L2 regularization,
 // Xavier/He initialization, LR decay, Early stopping, Data normalization
