@@ -1,17 +1,72 @@
 //
-// MLPCuda - CUDA Command-line Multi-Layer Perceptron
-// Full CLI with save/load, matching the Pascal MLPFacade interface
+// MLPCuda - CUDA Command-line Multi-Layer Perceptron with Full Facade
+// CLI: Create, Train, Predict, Inspect, and Directly Modify Model Internals
+// Matches and extends the Pascal MLPFacade interface
 //
 // Matthew Abbott 2025
 //
-// Compile: nvcc -o mlpcuda mlpcuda.cu -lcurand
+// Compile: 
+//   nvcc -o mlpcuda facaded_mlp.cu -lcurand
 //
-// Usage:
-//   mlpcuda create --input=N --hidden=N,N,... --output=N [options] --save=file
-//   mlpcuda train --model=file --data=file [options] --save=file
-//   mlpcuda predict --model=file --input=v1,v2,...
-//   mlpcuda info --model=file
+// Usage (core commands):
+//   mlpcuda create --input=N --hidden=N,N,... --output=N [options] --save=FILE
+//   mlpcuda train --model=FILE --data=FILE [options] --save=FILE
+//   mlpcuda predict --model=FILE --input=v1,v2,...
+//   mlpcuda info --model=FILE
 //   mlpcuda help
+//
+// Options:
+//   --input=N                  Input layer size
+//   --hidden=N,N,...           Hidden layer sizes (comma-separated)
+//   --output=N                 Output layer size
+//   --save=FILE                Save model to file
+//   --model=FILE               Model file to load
+//   --data=FILE                Training data CSV
+//   --lr=VALUE                 Learning rate
+//   --optimizer=TYPE           sgd|adam|rmsprop
+//   --hidden-act=TYPE          sigmoid|tanh|relu|softmax
+//   --output-act=TYPE          sigmoid|tanh|relu|softmax
+//   --dropout=VALUE            Dropout rate 0-1
+//   --l2=VALUE                 L2 regularization
+//   --beta1=VALUE              Adam beta1
+//   --beta2=VALUE              Adam beta2
+//   --epochs=N                 Training epochs
+//   --batch=N                  Training batch size
+//   --lr-decay                 Enable learning rate decay
+//   --lr-decay-rate=VALUE      Learning rate decay rate
+//   --lr-decay-epochs=N        Iterations between learning rate decay
+//   --early-stop               Enable early stopping
+//   --patience=N               Early stopping patience
+//   --normalize                Normalize input data before training
+//   --verbose                  Show training progress
+//
+// Facade Inspection/Modification Commands:
+//   get-weight     --model=FILE --layer=N --neuron=N --weight=N
+//   set-weight     --model=FILE --layer=N --neuron=N --weight=N --value=V --save=FILE
+//   get-weights    --model=FILE --layer=N --neuron=N
+//   get-bias       --model=FILE --layer=N --neuron=N
+//   set-bias       --model=FILE --layer=N --neuron=N --value=V --save=FILE
+//   get-output     --model=FILE --layer=N [--run-input=V1,V2,...]
+//   get-error      --model=FILE --layer=N [after train step]
+//   layer-info     --model=FILE --layer=N [--run-input=V1,V2,...]
+//   histogram      --model=FILE --layer=N --type=activation|gradient [--run-input=V1,V2,...] [--bins=N]
+//   get-optimizer  --model=FILE --layer=N --neuron=N [--weight=N]
+//
+// Examples:
+//   mlpcuda create --input=2 --hidden=8 --output=1 --save=xor.bin
+//   mlpcuda train --model=xor.bin --data=xor_cuda.csv --epochs=1000 --save=xor_trained.bin
+//   mlpcuda predict --model=xor_trained.bin --input=1,0
+//   mlpcuda info --model=xor_trained.bin
+//
+//   # Facade (model inspection/hacking):
+//   mlpcuda get-weight --model=m.bin --layer=1 --neuron=0 --weight=2
+//   mlpcuda set-weight --model=m.bin --layer=1 --neuron=0 --weight=2 --value=0.5 --save=m.bin
+//   mlpcuda get-weights --model=m.bin --layer=1 --neuron=0
+//   mlpcuda get-bias --model=m.bin --layer=1 --neuron=0
+//   mlpcuda get-output --model=m.bin --layer=1 --run-input=1,0
+//   mlpcuda layer-info --model=m.bin --layer=1 --run-input=1,0
+//   mlpcuda histogram --model=m.bin --layer=1 --type=activation --run-input=1,0
+//   mlpcuda get-optimizer --model=m.bin --layer=1 --neuron=0 --weight=0
 //
 
 #include <cuda_runtime.h>
