@@ -40,7 +40,6 @@ nvcc -o mlpcuda facaded_mlp.cu -lcurand
 
 - **mlp.cu**&nbsp;&nbsp;&mdash; Core CUDA MLP (minimal CLI)
 - **facaded_mlp.cu**&nbsp;&nbsp;&mdash; CLI + Facade version (full internal inspection/modification)
-- **examples/xor_cuda.csv**&nbsp;&nbsp;&mdash; Example data (XOR)
 - **LICENSE**&nbsp;&nbsp;&mdash; MIT License
 - **README.md**&nbsp;&nbsp;&mdash; This file
 
