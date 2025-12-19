@@ -6,7 +6,7 @@ MIT Licensed | GPU Powered | CLI & Facade | Open and Hackable
 
 ---
 
-## 🚀 What is GlassBoxAI-MLP?
+## What is GlassBoxAI-MLP?
 
 **A high-performance, fully-transparent, and extendable neural network toolkit in C++ & CUDA, designed for:**
 - **Speed** (GPU-accelerated learning and inference)
@@ -18,7 +18,7 @@ Built for audio, tabular data, education, science, and any hackable ML dream.
 
 ---
 
-## 🖥️ Build Requirements
+## Build Requirements
 
 - **NVIDIA GPU** with CUDA support (CUDA 11+ recommended)
 - **CUDA Toolkit** (`nvcc` in path)
@@ -36,7 +36,7 @@ nvcc -o mlpcuda facaded_mlp.cu -lcurand
 
 ---
 
-## 📦 File Structure
+## File Structure
 
 - **mlp.cu**&nbsp;&nbsp;&mdash; Core CUDA MLP (minimal CLI)
 - **facaded_mlp.cu**&nbsp;&nbsp;&mdash; CLI + Facade version (full internal inspection/modification)
@@ -46,7 +46,7 @@ nvcc -o mlpcuda facaded_mlp.cu -lcurand
 
 ---
 
-## 🕹️ CLI Usage Overview
+## CLI Usage Overview
 
 ### Common Commands
 
@@ -82,7 +82,7 @@ get-optimizer # Display optimizer (Adam/RMSProp) state, M/V stats
 
 ---
 
-## 💡 Quick Example: XOR with Minimal MLP (`mlp.cu`)
+## Quick Example: XOR with Minimal MLP (`mlp.cu`)
 
 ### Create & Train
 
@@ -128,7 +128,7 @@ Hyperparameters: [full dump...]
 
 ---
 
-## 🔎 Facade Demo: Inspect & Hack Internals (`facaded_mlp.cu`, `mlpcuda`)
+## Facade Demo: Inspect & Hack Internals (`facaded_mlp.cu`, `mlpcuda`)
 
 ### Create & Train
 ```sh
@@ -177,7 +177,7 @@ Model saved to: test.bin
 
 ---
 
-## 📚 Help Screens
+## Help Screens
 
 ### Core CLI Help
 ```
@@ -202,7 +202,7 @@ Facade Examples:
 
 ---
 
-## 🏆 Why GlassBoxAI-MLP?
+## Why GlassBoxAI-MLP?
 
 - **Perfect reproducible XOR and classic ML fits (see above)**
 - **Built for hacking:** adjust weights, biases, optimizer states, activations, and more at runtime—no black-box barriers!
@@ -211,7 +211,7 @@ Facade Examples:
 
 ---
 
-## 💾 Example Dataset (XOR)
+## Example Dataset (XOR)
 
 _Create `xor_cuda.csv`:_
 ```
@@ -223,7 +223,7 @@ _Create `xor_cuda.csv`:_
 
 ---
 
-## 🤝 Contributing & Sponsoring
+## Contributing & Sponsoring
 
 - Fork, file issues, send PRs!
 - [Sponsor @matthewJamesAbbott](https://github.com/sponsors/matthewJamesAbbott)
@@ -231,7 +231,7 @@ _Create `xor_cuda.csv`:_
 
 ---
 
-## 📜 License
+## License
 
 MIT License  
 © 2025 Matthew Abbott
