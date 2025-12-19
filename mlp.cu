@@ -1,17 +1,51 @@
 //
-// Matthew Abbott 2025
-// CUDA Port of MLP with CLI interface
+// MLPCuda - CUDA Command-line Multi-Layer Perceptron (Core Version, No Facade)
+// CLI: Create, Train, Predict, Inspect models. For scripting or research use.
 // Enhanced with: Softmax, Adam/RMSProp optimizers, Dropout, L2 regularization,
-// Xavier/He initialization, LR decay, Early stopping, Data normalization
+// Xavier/He initialization, LR decay, Early stopping, Data normalization.
 //
-// Compile: nvcc -o mlp_cuda mlp.cu -lcurand
+// Matthew Abbott 2025
 //
-// Usage:
-//   mlp_cuda create --input=N --hidden=N,N,... --output=N [options] --save=file
-//   mlp_cuda train --model=file --data=file [options] --save=file
-//   mlp_cuda predict --model=file --input=v1,v2,...
-//   mlp_cuda info --model=file
+// Compile: 
+//   nvcc -o mlp_cuda mlp.cu -lcurand
+//
+// Usage (commands):
+//   mlp_cuda create --input=N --hidden=N,N,... --output=N [options] --save=FILE
+//   mlp_cuda train --model=FILE --data=FILE [options] --save=FILE
+//   mlp_cuda predict --model=FILE --input=v1,v2,...
+//   mlp_cuda info --model=FILE
 //   mlp_cuda help
+//
+// Options:
+//   --input=N                  Input layer size (required)
+//   --hidden=N,N,...           Hidden layer sizes (comma-separated, required)
+//   --output=N                 Output layer size (required)
+//   --save=FILE                Save model to file (required)
+//   --model=FILE               Model file to load
+//   --data=FILE                Training data CSV file
+//   --lr=VALUE                 Learning rate (default: 0.1)
+//   --optimizer=TYPE           sgd|adam|rmsprop (default: sgd)
+//   --hidden-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
+//   --output-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
+//   --dropout=VALUE            Dropout rate 0-1 (default: 0)
+//   --l2=VALUE                 L2 regularization (default: 0)
+//   --beta1=VALUE              Adam beta1 (default: 0.9)
+//   --beta2=VALUE              Adam beta2 (default: 0.999)
+//   --epochs=N                 Training epochs (default: 100)
+//   --batch=N                  Training batch size (default: 1)
+//   --lr-decay                 Enable learning rate decay
+//   --lr-decay-rate=VALUE      Learning rate decay rate (default: 0.95)
+//   --lr-decay-epochs=N        Iterations between learning rate decay (default: 10)
+//   --early-stop               Enable early stopping
+//   --patience=N               Early stopping patience (default: 10)
+//   --normalize                Normalize input data before training
+//   --verbose                  Show training progress
+//
+// Examples:
+//   mlp_cuda create --input=2 --hidden=8 --output=1 --save=xor.bin
+//   mlp_cuda train --model=xor.bin --data=xor_cuda.csv --epochs=1000 --save=xor_trained.bin
+//   mlp_cuda predict --model=xor_trained.bin --input=1,0
+//   mlp_cuda info --model=xor_trained.bin
 //
 
 #include <cuda_runtime.h>
