@@ -1,10 +1,17 @@
 //
 // Matthew Abbott 19/3/2023
-// CUDA Port of MLP
+// CUDA Port of MLP with CLI interface
 // Enhanced with: Softmax, Adam/RMSProp optimizers, Dropout, L2 regularization,
 // Xavier/He initialization, LR decay, Early stopping, Data normalization
 //
 // Compile: nvcc -o mlp_cuda mlp.cu -lcurand
+//
+// Usage:
+//   mlp_cuda create --input=N --hidden=N,N,... --output=N [options] --save=file
+//   mlp_cuda train --model=file --data=file [options] --save=file
+//   mlp_cuda predict --model=file --input=v1,v2,...
+//   mlp_cuda info --model=file
+//   mlp_cuda help
 //
 
 #include <cuda_runtime.h>
@@ -15,6 +22,10 @@
 #include <cstdio>
 #include <ctime>
 #include <cstring>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
 
 #define CUDA_CHECK(call) \
     do { \
@@ -27,9 +38,11 @@
 
 const double EPSILON = 1e-15;
 const int BLOCK_SIZE = 256;
+const char MODEL_MAGIC[] = "MLPCUDA1";
 
-enum TActivationType { atSigmoid, atTanh, atReLU, atSoftmax };
-enum TOptimizerType { otSGD, otAdam, otRMSProp };
+enum TActivationType { atSigmoid = 0, atTanh = 1, atReLU = 2, atSoftmax = 3 };
+enum TOptimizerType { otSGD = 0, otAdam = 1, otRMSProp = 2 };
+enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp };
 
 __device__ double d_Sigmoid(double x) {
     if (x < -500) return 0;
@@ -250,13 +263,11 @@ private:
     int NumLayers;
     int FInputSize;
     int FOutputSize;
-    int* FHiddenSizes;
-    int FHiddenLayerCount;
+    std::vector<int> FHiddenSizes;
     bool FIsTraining;
     curandState* d_RandStates;
     int MaxNeurons;
 
-    double* d_Input;
     double* d_Target;
     double* d_SoftmaxSums;
 
@@ -301,15 +312,15 @@ private:
     }
 
     void FreeLayer(LayerData& layer) {
-        cudaFree(layer.Weights);
-        cudaFree(layer.Biases);
-        cudaFree(layer.Outputs);
-        cudaFree(layer.Errors);
-        cudaFree(layer.M);
-        cudaFree(layer.V);
-        cudaFree(layer.MBias);
-        cudaFree(layer.VBias);
-        cudaFree(layer.DropoutMask);
+        if (layer.Weights) cudaFree(layer.Weights);
+        if (layer.Biases) cudaFree(layer.Biases);
+        if (layer.Outputs) cudaFree(layer.Outputs);
+        if (layer.Errors) cudaFree(layer.Errors);
+        if (layer.M) cudaFree(layer.M);
+        if (layer.V) cudaFree(layer.V);
+        if (layer.MBias) cudaFree(layer.MBias);
+        if (layer.VBias) cudaFree(layer.VBias);
+        if (layer.DropoutMask) cudaFree(layer.DropoutMask);
     }
 
 public:
@@ -329,7 +340,7 @@ public:
     bool EnableEarlyStopping;
     int EarlyStoppingPatience;
 
-    TMultiLayerPerceptronCUDA(int InputSize, const int* HiddenSizes, int NumHidden, int OutputSize,
+    TMultiLayerPerceptronCUDA(int InputSize, const std::vector<int>& HiddenSizes, int OutputSize,
                               TActivationType HiddenAct = atSigmoid, TActivationType OutputAct = atSigmoid) {
         LearningRate = 0.1;
         MaxIterations = 100;
@@ -350,21 +361,18 @@ public:
 
         FInputSize = InputSize;
         FOutputSize = OutputSize;
-        FHiddenLayerCount = NumHidden;
+        FHiddenSizes = HiddenSizes;
 
-        FHiddenSizes = new int[NumHidden];
-        for (int i = 0; i < NumHidden; i++)
-            FHiddenSizes[i] = HiddenSizes[i];
-
-        NumLayers = NumHidden + 2;
+        NumLayers = HiddenSizes.size() + 2;
         h_Layers = new LayerData[NumLayers];
+        memset(h_Layers, 0, NumLayers * sizeof(LayerData));
         CUDA_CHECK(cudaMalloc(&d_Layers, NumLayers * sizeof(LayerData)));
 
         AllocateLayer(h_Layers[0], InputSize + 1, InputSize, atSigmoid);
 
         MaxNeurons = InputSize + 1;
         int numInputs = InputSize;
-        for (int i = 0; i < NumHidden; i++) {
+        for (size_t i = 0; i < HiddenSizes.size(); i++) {
             AllocateLayer(h_Layers[i + 1], HiddenSizes[i] + 1, numInputs + 1, HiddenActivation);
             if (HiddenSizes[i] + 1 > MaxNeurons) MaxNeurons = HiddenSizes[i] + 1;
             numInputs = HiddenSizes[i];
@@ -380,7 +388,6 @@ public:
         InitRandStates<<<blocks, BLOCK_SIZE>>>(d_RandStates, time(nullptr), MaxNeurons);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        CUDA_CHECK(cudaMalloc(&d_Input, (InputSize + 1) * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_Target, OutputSize * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_SoftmaxSums, OutputSize * sizeof(double)));
     }
@@ -389,10 +396,8 @@ public:
         for (int i = 0; i < NumLayers; i++)
             FreeLayer(h_Layers[i]);
         delete[] h_Layers;
-        delete[] FHiddenSizes;
         cudaFree(d_Layers);
         cudaFree(d_RandStates);
-        cudaFree(d_Input);
         cudaFree(d_Target);
         cudaFree(d_SoftmaxSums);
     }
@@ -483,7 +488,11 @@ public:
     void Predict(const double* Input, double* Result) {
         FIsTraining = false;
 
-        CUDA_CHECK(cudaMemcpy(h_Layers[0].Outputs, Input, (FInputSize + 1) * sizeof(double), cudaMemcpyHostToDevice));
+        double* h_input = new double[FInputSize + 1];
+        for (int i = 0; i < FInputSize; i++) h_input[i] = Input[i];
+        h_input[FInputSize] = 1.0;
+        CUDA_CHECK(cudaMemcpy(h_Layers[0].Outputs, h_input, (FInputSize + 1) * sizeof(double), cudaMemcpyHostToDevice));
+        delete[] h_input;
 
         FeedForward();
 
@@ -495,7 +504,12 @@ public:
     void Train(const double* Input, const double* Target) {
         FIsTraining = true;
 
-        CUDA_CHECK(cudaMemcpy(h_Layers[0].Outputs, Input, (FInputSize + 1) * sizeof(double), cudaMemcpyHostToDevice));
+        double* h_input = new double[FInputSize + 1];
+        for (int i = 0; i < FInputSize; i++) h_input[i] = Input[i];
+        h_input[FInputSize] = 1.0;
+        CUDA_CHECK(cudaMemcpy(h_Layers[0].Outputs, h_input, (FInputSize + 1) * sizeof(double), cudaMemcpyHostToDevice));
+        delete[] h_input;
+
         CUDA_CHECK(cudaMemcpy(d_Target, Target, FOutputSize * sizeof(double), cudaMemcpyHostToDevice));
 
         FeedForward();
@@ -523,6 +537,161 @@ public:
 
     int GetOutputSize() const { return FOutputSize; }
     int GetInputSize() const { return FInputSize; }
+    int GetHiddenLayerCount() const { return FHiddenSizes.size(); }
+    const std::vector<int>& GetHiddenSizes() const { return FHiddenSizes; }
+    int GetNumLayers() const { return NumLayers; }
+
+    int GetLayerSize(int layerIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        return h_Layers[layerIdx].NumNeurons;
+    }
+
+    bool Save(const char* filename) {
+        FILE* f = fopen(filename, "wb");
+        if (!f) return false;
+
+        fwrite(MODEL_MAGIC, 1, 8, f);
+        fwrite(&FInputSize, sizeof(int), 1, f);
+        fwrite(&FOutputSize, sizeof(int), 1, f);
+        int numHidden = FHiddenSizes.size();
+        fwrite(&numHidden, sizeof(int), 1, f);
+        fwrite(FHiddenSizes.data(), sizeof(int), numHidden, f);
+
+        fwrite(&LearningRate, sizeof(double), 1, f);
+        int opt = (int)Optimizer;
+        fwrite(&opt, sizeof(int), 1, f);
+        int hidAct = (int)HiddenActivation;
+        fwrite(&hidAct, sizeof(int), 1, f);
+        int outAct = (int)OutputActivation;
+        fwrite(&outAct, sizeof(int), 1, f);
+        fwrite(&DropoutRate, sizeof(double), 1, f);
+        fwrite(&L2Lambda, sizeof(double), 1, f);
+        fwrite(&Beta1, sizeof(double), 1, f);
+        fwrite(&Beta2, sizeof(double), 1, f);
+        fwrite(&Timestep, sizeof(int), 1, f);
+        fwrite(&EnableLRDecay, sizeof(bool), 1, f);
+        fwrite(&LRDecayRate, sizeof(double), 1, f);
+        fwrite(&LRDecayEpochs, sizeof(int), 1, f);
+        fwrite(&EnableEarlyStopping, sizeof(bool), 1, f);
+        fwrite(&EarlyStoppingPatience, sizeof(int), 1, f);
+
+        for (int k = 0; k < NumLayers; k++) {
+            LayerData& layer = h_Layers[k];
+            int weightSize = layer.NumNeurons * layer.NumInputs;
+
+            double* h_weights = new double[weightSize];
+            double* h_biases = new double[layer.NumNeurons];
+            double* h_M = new double[weightSize];
+            double* h_V = new double[weightSize];
+            double* h_MBias = new double[layer.NumNeurons];
+            double* h_VBias = new double[layer.NumNeurons];
+
+            CUDA_CHECK(cudaMemcpy(h_weights, layer.Weights, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_biases, layer.Biases, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_M, layer.M, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_V, layer.V, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_MBias, layer.MBias, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_VBias, layer.VBias, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+
+            fwrite(h_weights, sizeof(double), weightSize, f);
+            fwrite(h_biases, sizeof(double), layer.NumNeurons, f);
+            fwrite(h_M, sizeof(double), weightSize, f);
+            fwrite(h_V, sizeof(double), weightSize, f);
+            fwrite(h_MBias, sizeof(double), layer.NumNeurons, f);
+            fwrite(h_VBias, sizeof(double), layer.NumNeurons, f);
+
+            delete[] h_weights;
+            delete[] h_biases;
+            delete[] h_M;
+            delete[] h_V;
+            delete[] h_MBias;
+            delete[] h_VBias;
+        }
+
+        fclose(f);
+        return true;
+    }
+
+    static TMultiLayerPerceptronCUDA* Load(const char* filename) {
+        FILE* f = fopen(filename, "rb");
+        if (!f) return nullptr;
+
+        char magic[9] = {0};
+        fread(magic, 1, 8, f);
+        if (strcmp(magic, MODEL_MAGIC) != 0) {
+            fclose(f);
+            return nullptr;
+        }
+
+        int inputSize, outputSize, numHidden;
+        fread(&inputSize, sizeof(int), 1, f);
+        fread(&outputSize, sizeof(int), 1, f);
+        fread(&numHidden, sizeof(int), 1, f);
+
+        std::vector<int> hiddenSizes(numHidden);
+        fread(hiddenSizes.data(), sizeof(int), numHidden, f);
+
+        double learningRate;
+        int opt, hidAct, outAct;
+        fread(&learningRate, sizeof(double), 1, f);
+        fread(&opt, sizeof(int), 1, f);
+        fread(&hidAct, sizeof(int), 1, f);
+        fread(&outAct, sizeof(int), 1, f);
+
+        TMultiLayerPerceptronCUDA* mlp = new TMultiLayerPerceptronCUDA(
+            inputSize, hiddenSizes, outputSize, 
+            (TActivationType)hidAct, (TActivationType)outAct);
+
+        mlp->LearningRate = learningRate;
+        mlp->Optimizer = (TOptimizerType)opt;
+
+        fread(&mlp->DropoutRate, sizeof(double), 1, f);
+        fread(&mlp->L2Lambda, sizeof(double), 1, f);
+        fread(&mlp->Beta1, sizeof(double), 1, f);
+        fread(&mlp->Beta2, sizeof(double), 1, f);
+        fread(&mlp->Timestep, sizeof(int), 1, f);
+        fread(&mlp->EnableLRDecay, sizeof(bool), 1, f);
+        fread(&mlp->LRDecayRate, sizeof(double), 1, f);
+        fread(&mlp->LRDecayEpochs, sizeof(int), 1, f);
+        fread(&mlp->EnableEarlyStopping, sizeof(bool), 1, f);
+        fread(&mlp->EarlyStoppingPatience, sizeof(int), 1, f);
+
+        for (int k = 0; k < mlp->NumLayers; k++) {
+            LayerData& layer = mlp->h_Layers[k];
+            int weightSize = layer.NumNeurons * layer.NumInputs;
+
+            double* h_weights = new double[weightSize];
+            double* h_biases = new double[layer.NumNeurons];
+            double* h_M = new double[weightSize];
+            double* h_V = new double[weightSize];
+            double* h_MBias = new double[layer.NumNeurons];
+            double* h_VBias = new double[layer.NumNeurons];
+
+            fread(h_weights, sizeof(double), weightSize, f);
+            fread(h_biases, sizeof(double), layer.NumNeurons, f);
+            fread(h_M, sizeof(double), weightSize, f);
+            fread(h_V, sizeof(double), weightSize, f);
+            fread(h_MBias, sizeof(double), layer.NumNeurons, f);
+            fread(h_VBias, sizeof(double), layer.NumNeurons, f);
+
+            CUDA_CHECK(cudaMemcpy(layer.Weights, h_weights, weightSize * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(layer.Biases, h_biases, layer.NumNeurons * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(layer.M, h_M, weightSize * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(layer.V, h_V, weightSize * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(layer.MBias, h_MBias, layer.NumNeurons * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(layer.VBias, h_VBias, layer.NumNeurons * sizeof(double), cudaMemcpyHostToDevice));
+
+            delete[] h_weights;
+            delete[] h_biases;
+            delete[] h_M;
+            delete[] h_V;
+            delete[] h_MBias;
+            delete[] h_VBias;
+        }
+
+        fclose(f);
+        return mlp;
+    }
 };
 
 double RandomDouble() {
@@ -537,251 +706,418 @@ int MaxIndex(const double* arr, int n) {
     return result;
 }
 
-struct TDataPoint {
-    double* Input;
-    double* Target;
-    int InputSize;
-    int TargetSize;
+struct DataPoint {
+    std::vector<double> Input;
+    std::vector<double> Target;
 };
 
-struct TDataPointArray {
-    TDataPoint* Data;
-    int Length;
-
-    void SetLength(int n, int inputSize, int targetSize) {
-        Data = new TDataPoint[n];
-        Length = n;
-        for (int i = 0; i < n; i++) {
-            Data[i].Input = new double[inputSize];
-            Data[i].Target = new double[targetSize];
-            Data[i].InputSize = inputSize;
-            Data[i].TargetSize = targetSize;
-        }
+const char* ActivationToStr(TActivationType act) {
+    switch (act) {
+        case atSigmoid: return "sigmoid";
+        case atTanh: return "tanh";
+        case atReLU: return "relu";
+        case atSoftmax: return "softmax";
     }
+    return "sigmoid";
+}
 
-    void Free() {
-        for (int i = 0; i < Length; i++) {
-            delete[] Data[i].Input;
-            delete[] Data[i].Target;
-        }
-        delete[] Data;
+const char* OptimizerToStr(TOptimizerType opt) {
+    switch (opt) {
+        case otSGD: return "sgd";
+        case otAdam: return "adam";
+        case otRMSProp: return "rmsprop";
     }
+    return "sgd";
+}
 
-    TDataPoint& operator[](int i) { return Data[i]; }
-};
+TActivationType ParseActivation(const char* s) {
+    if (strcasecmp(s, "tanh") == 0) return atTanh;
+    if (strcasecmp(s, "relu") == 0) return atReLU;
+    if (strcasecmp(s, "softmax") == 0) return atSoftmax;
+    return atSigmoid;
+}
 
-void ShuffleData(TDataPointArray& Data) {
-    for (int i = Data.Length - 1; i >= 1; i--) {
+TOptimizerType ParseOptimizer(const char* s) {
+    if (strcasecmp(s, "adam") == 0) return otAdam;
+    if (strcasecmp(s, "rmsprop") == 0) return otRMSProp;
+    return otSGD;
+}
+
+std::vector<int> ParseIntArray(const char* s) {
+    std::vector<int> result;
+    std::stringstream ss(s);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        result.push_back(atoi(token.c_str()));
+    }
+    return result;
+}
+
+std::vector<double> ParseDoubleArray(const char* s) {
+    std::vector<double> result;
+    std::stringstream ss(s);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        result.push_back(atof(token.c_str()));
+    }
+    return result;
+}
+
+std::vector<DataPoint> LoadDataCSV(const char* filename, int inputSize, int outputSize) {
+    std::vector<DataPoint> data;
+    std::ifstream file(filename);
+    if (!file.is_open()) return data;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        std::vector<double> values = ParseDoubleArray(line.c_str());
+        if ((int)values.size() < inputSize + outputSize) continue;
+
+        DataPoint dp;
+        dp.Input.resize(inputSize);
+        dp.Target.resize(outputSize);
+        for (int i = 0; i < inputSize; i++) dp.Input[i] = values[i];
+        for (int i = 0; i < outputSize; i++) dp.Target[i] = values[inputSize + i];
+        data.push_back(dp);
+    }
+    return data;
+}
+
+void ShuffleData(std::vector<DataPoint>& data) {
+    for (int i = data.size() - 1; i >= 1; i--) {
         int j = rand() % (i + 1);
-        TDataPoint temp = Data[i];
-        Data[i] = Data[j];
-        Data[j] = temp;
+        std::swap(data[i], data[j]);
     }
 }
 
-int TrainWithEarlyStopping(TMultiLayerPerceptronCUDA* MLP, TDataPointArray& Data, int MaxEpochs, int BatchSize) {
-    int ValSize = Data.Length / 10;
-    if (ValSize < 1) ValSize = 1;
+void NormalizeData(std::vector<DataPoint>& data) {
+    if (data.empty()) return;
+    int inputSize = data[0].Input.size();
 
-    double BestLoss = 1e30;
-    int EpochsWithoutImprovement = 0;
-    double InitialLR = MLP->LearningRate;
-
-    double* Pred = new double[MLP->GetOutputSize()];
-
-    for (int Epoch = 1; Epoch <= MaxEpochs; Epoch++) {
-        if (MLP->EnableLRDecay && (Epoch > 1) && (Epoch % MLP->LRDecayEpochs == 0))
-            MLP->LearningRate *= MLP->LRDecayRate;
-
-        ShuffleData(Data);
-
-        for (int i = ValSize; i < Data.Length; i++)
-            MLP->Train(Data[i].Input, Data[i].Target);
-
-        if (MLP->EnableEarlyStopping) {
-            double ValLoss = 0;
-            for (int i = 0; i < ValSize; i++) {
-                MLP->Predict(Data[i].Input, Pred);
-                ValLoss += MLP->ComputeLoss(Pred, Data[i].Target);
-            }
-            ValLoss /= ValSize;
-
-            if (ValLoss < BestLoss - EPSILON) {
-                BestLoss = ValLoss;
-                EpochsWithoutImprovement = 0;
-            } else {
-                EpochsWithoutImprovement++;
-            }
-
-            if (EpochsWithoutImprovement >= MLP->EarlyStoppingPatience) {
-                printf("Early stopping at epoch %d (validation loss: %.6f)\n", Epoch, ValLoss);
-                MLP->LearningRate = InitialLR;
-                delete[] Pred;
-                return Epoch;
-            }
+    std::vector<double> mins(inputSize), maxs(inputSize);
+    for (int j = 0; j < inputSize; j++) {
+        mins[j] = maxs[j] = data[0].Input[j];
+    }
+    for (auto& dp : data) {
+        for (int j = 0; j < inputSize; j++) {
+            if (dp.Input[j] < mins[j]) mins[j] = dp.Input[j];
+            if (dp.Input[j] > maxs[j]) maxs[j] = dp.Input[j];
         }
     }
-
-    MLP->LearningRate = InitialLR;
-    delete[] Pred;
-    return MaxEpochs;
-}
-
-double TestAccuracy(TMultiLayerPerceptronCUDA* MLP, TDataPointArray& Data) {
-    double* Pred = new double[MLP->GetOutputSize()];
-    int correct = 0;
-
-    for (int i = 0; i < Data.Length; i++) {
-        MLP->Predict(Data[i].Input, Pred);
-        int predClass = MaxIndex(Pred, MLP->GetOutputSize());
-        int actualClass = MaxIndex(Data[i].Target, MLP->GetOutputSize());
-        if (predClass == actualClass) correct++;
-    }
-
-    delete[] Pred;
-    return (double)correct / Data.Length;
-}
-
-double PrecisionScore(TMultiLayerPerceptronCUDA* MLP, TDataPointArray& Data, int ClassIndex) {
-    double* Pred = new double[MLP->GetOutputSize()];
-    int TP = 0, FP = 0;
-
-    for (int i = 0; i < Data.Length; i++) {
-        MLP->Predict(Data[i].Input, Pred);
-        int predClass = MaxIndex(Pred, MLP->GetOutputSize());
-        int actualClass = MaxIndex(Data[i].Target, MLP->GetOutputSize());
-
-        if (predClass == ClassIndex) {
-            if (actualClass == ClassIndex) TP++;
-            else FP++;
+    for (auto& dp : data) {
+        for (int j = 0; j < inputSize; j++) {
+            double range = maxs[j] - mins[j];
+            dp.Input[j] = (range > 0) ? (dp.Input[j] - mins[j]) / range : 0.5;
         }
     }
-
-    delete[] Pred;
-    return (TP + FP == 0) ? 0 : (double)TP / (TP + FP);
 }
 
-double RecallScore(TMultiLayerPerceptronCUDA* MLP, TDataPointArray& Data, int ClassIndex) {
-    double* Pred = new double[MLP->GetOutputSize()];
-    int TP = 0, FN = 0;
-
-    for (int i = 0; i < Data.Length; i++) {
-        MLP->Predict(Data[i].Input, Pred);
-        int predClass = MaxIndex(Pred, MLP->GetOutputSize());
-        int actualClass = MaxIndex(Data[i].Target, MLP->GetOutputSize());
-
-        if (actualClass == ClassIndex) {
-            if (predClass == ClassIndex) TP++;
-            else FN++;
-        }
-    }
-
-    delete[] Pred;
-    return (TP + FN == 0) ? 0 : (double)TP / (TP + FN);
+void PrintUsage() {
+    printf("MLP CUDA - Command-line Multi-Layer Perceptron\n");
+    printf("\n");
+    printf("Commands:\n");
+    printf("  create   Create a new MLP model\n");
+    printf("  train    Train an existing model with data\n");
+    printf("  predict  Make predictions with a trained model\n");
+    printf("  info     Display model information\n");
+    printf("  help     Show this help message\n");
+    printf("\n");
+    printf("Create Options:\n");
+    printf("  --input=N              Input layer size (required)\n");
+    printf("  --hidden=N,N,...       Hidden layer sizes (required)\n");
+    printf("  --output=N             Output layer size (required)\n");
+    printf("  --save=FILE            Save model to file (required)\n");
+    printf("  --lr=VALUE             Learning rate (default: 0.1)\n");
+    printf("  --optimizer=TYPE       sgd|adam|rmsprop (default: sgd)\n");
+    printf("  --hidden-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
+    printf("  --output-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
+    printf("  --dropout=VALUE        Dropout rate 0-1 (default: 0)\n");
+    printf("  --l2=VALUE             L2 regularization (default: 0)\n");
+    printf("  --beta1=VALUE          Adam beta1 (default: 0.9)\n");
+    printf("  --beta2=VALUE          Adam beta2 (default: 0.999)\n");
+    printf("\n");
+    printf("Train Options:\n");
+    printf("  --model=FILE           Model file to load (required)\n");
+    printf("  --data=FILE            Training data CSV file (required)\n");
+    printf("  --save=FILE            Save trained model to file (required)\n");
+    printf("  --epochs=N             Number of training epochs (default: 100)\n");
+    printf("  --batch=N              Batch size (default: 1)\n");
+    printf("  --lr=VALUE             Override learning rate\n");
+    printf("  --lr-decay             Enable learning rate decay\n");
+    printf("  --lr-decay-rate=VALUE  LR decay rate (default: 0.95)\n");
+    printf("  --lr-decay-epochs=N    Epochs between decay (default: 10)\n");
+    printf("  --early-stop           Enable early stopping\n");
+    printf("  --patience=N           Early stopping patience (default: 10)\n");
+    printf("  --normalize            Normalize input data\n");
+    printf("  --verbose              Show training progress\n");
+    printf("\n");
+    printf("Predict Options:\n");
+    printf("  --model=FILE           Model file to load (required)\n");
+    printf("  --input=v1,v2,...      Input values (required)\n");
+    printf("\n");
+    printf("Info Options:\n");
+    printf("  --model=FILE           Model file to load (required)\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  mlp_cuda create --input=2 --hidden=4,4 --output=1 --save=xor.bin\n");
+    printf("  mlp_cuda train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin\n");
+    printf("  mlp_cuda predict --model=xor_trained.bin --input=1,0\n");
+    printf("  mlp_cuda info --model=xor_trained.bin\n");
 }
 
-double F1Score(double Precision, double Recall) {
-    return (Precision + Recall == 0) ? 0 : 2 * Precision * Recall / (Precision + Recall);
-}
-
-int main() {
+int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
+
+    if (argc < 2) {
+        PrintUsage();
+        return 0;
+    }
+
+    TCommand command = cmdNone;
+    std::string cmdStr = argv[1];
+    if (cmdStr == "create") command = cmdCreate;
+    else if (cmdStr == "train") command = cmdTrain;
+    else if (cmdStr == "predict") command = cmdPredict;
+    else if (cmdStr == "info") command = cmdInfo;
+    else if (cmdStr == "help" || cmdStr == "--help" || cmdStr == "-h") command = cmdHelp;
+    else {
+        printf("Unknown command: %s\n", argv[1]);
+        PrintUsage();
+        return 1;
+    }
+
+    if (command == cmdHelp) {
+        PrintUsage();
+        return 0;
+    }
+
+    int inputSize = 0, outputSize = 0;
+    std::vector<int> hiddenSizes;
+    std::vector<double> inputValues;
+    std::string modelFile, saveFile, dataFile;
+    double learningRate = 0.1;
+    TOptimizerType optimizer = otSGD;
+    TActivationType hiddenAct = atSigmoid, outputAct = atSigmoid;
+    double dropoutRate = 0, l2Lambda = 0, beta1 = 0.9, beta2 = 0.999;
+    int epochs = 100, batchSize = 1;
+    bool lrDecay = false, earlyStop = false, normalize = false, verbose = false;
+    double lrDecayRate = 0.95;
+    int lrDecayEpochs = 10, patience = 10;
+    bool lrOverride = false;
+
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+
+        if (arg == "--lr-decay") { lrDecay = true; continue; }
+        if (arg == "--early-stop") { earlyStop = true; continue; }
+        if (arg == "--normalize") { normalize = true; continue; }
+        if (arg == "--verbose") { verbose = true; continue; }
+
+        size_t eq = arg.find('=');
+        if (eq == std::string::npos) {
+            printf("Invalid argument: %s\n", arg.c_str());
+            continue;
+        }
+
+        std::string key = arg.substr(0, eq);
+        std::string value = arg.substr(eq + 1);
+
+        if (key == "--input") {
+            if (command == cmdPredict)
+                inputValues = ParseDoubleArray(value.c_str());
+            else
+                inputSize = atoi(value.c_str());
+        }
+        else if (key == "--hidden") hiddenSizes = ParseIntArray(value.c_str());
+        else if (key == "--output") outputSize = atoi(value.c_str());
+        else if (key == "--model") modelFile = value;
+        else if (key == "--save") saveFile = value;
+        else if (key == "--data") dataFile = value;
+        else if (key == "--lr") { learningRate = atof(value.c_str()); lrOverride = true; }
+        else if (key == "--optimizer") optimizer = ParseOptimizer(value.c_str());
+        else if (key == "--hidden-act") hiddenAct = ParseActivation(value.c_str());
+        else if (key == "--output-act") outputAct = ParseActivation(value.c_str());
+        else if (key == "--dropout") dropoutRate = atof(value.c_str());
+        else if (key == "--l2") l2Lambda = atof(value.c_str());
+        else if (key == "--beta1") beta1 = atof(value.c_str());
+        else if (key == "--beta2") beta2 = atof(value.c_str());
+        else if (key == "--epochs") epochs = atoi(value.c_str());
+        else if (key == "--batch") batchSize = atoi(value.c_str());
+        else if (key == "--lr-decay-rate") lrDecayRate = atof(value.c_str());
+        else if (key == "--lr-decay-epochs") lrDecayEpochs = atoi(value.c_str());
+        else if (key == "--patience") patience = atoi(value.c_str());
+        else printf("Unknown option: %s\n", key.c_str());
+    }
 
     int deviceCount;
     cudaGetDeviceCount(&deviceCount);
     if (deviceCount == 0) {
-        printf("No CUDA devices found!\n");
+        printf("Error: No CUDA devices found!\n");
         return 1;
     }
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    printf("Using GPU: %s\n", prop.name);
-    printf("Compute capability: %d.%d\n\n", prop.major, prop.minor);
 
-    const int InputSize = 4;
-    const int OutputSize = 3;
+    if (command == cmdCreate) {
+        if (inputSize <= 0) { printf("Error: --input is required\n"); return 1; }
+        if (hiddenSizes.empty()) { printf("Error: --hidden is required\n"); return 1; }
+        if (outputSize <= 0) { printf("Error: --output is required\n"); return 1; }
+        if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
 
-    TDataPointArray Data;
-    Data.SetLength(7500, InputSize + 1, OutputSize);
+        TMultiLayerPerceptronCUDA* mlp = new TMultiLayerPerceptronCUDA(
+            inputSize, hiddenSizes, outputSize, hiddenAct, outputAct);
+        mlp->LearningRate = learningRate;
+        mlp->Optimizer = optimizer;
+        mlp->DropoutRate = dropoutRate;
+        mlp->L2Lambda = l2Lambda;
+        mlp->Beta1 = beta1;
+        mlp->Beta2 = beta2;
 
-    for (int i = 0; i < 2500; i++) {
-        Data[i].Input[0] = RandomDouble() * 0.5;
-        Data[i].Input[1] = RandomDouble() * 0.5;
-        Data[i].Input[2] = RandomDouble() * 0.5;
-        Data[i].Input[3] = RandomDouble() * 0.5;
-        Data[i].Target[0] = 1; Data[i].Target[1] = 0; Data[i].Target[2] = 0;
+        mlp->Save(saveFile.c_str());
+
+        printf("Created CUDA MLP model (GPU: %s):\n", prop.name);
+        printf("  Input size: %d\n", inputSize);
+        printf("  Hidden sizes: ");
+        for (size_t i = 0; i < hiddenSizes.size(); i++)
+            printf("%s%d", i > 0 ? "," : "", hiddenSizes[i]);
+        printf("\n");
+        printf("  Output size: %d\n", outputSize);
+        printf("  Hidden activation: %s\n", ActivationToStr(hiddenAct));
+        printf("  Output activation: %s\n", ActivationToStr(outputAct));
+        printf("  Optimizer: %s\n", OptimizerToStr(optimizer));
+        printf("  Learning rate: %.4f\n", learningRate);
+        printf("  Saved to: %s\n", saveFile.c_str());
+
+        delete mlp;
     }
-    for (int i = 2500; i < 5000; i++) {
-        Data[i].Input[0] = 0.5 + RandomDouble() * 0.5;
-        Data[i].Input[1] = 0.5 + RandomDouble() * 0.5;
-        Data[i].Input[2] = 0.5 + RandomDouble() * 0.5;
-        Data[i].Input[3] = 0.5 + RandomDouble() * 0.5;
-        Data[i].Target[0] = 0; Data[i].Target[1] = 1; Data[i].Target[2] = 0;
+    else if (command == cmdTrain) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (dataFile.empty()) { printf("Error: --data is required\n"); return 1; }
+        if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model: %s\n", modelFile.c_str()); return 1; }
+
+        if (lrOverride) mlp->LearningRate = learningRate;
+        mlp->EnableLRDecay = lrDecay;
+        mlp->LRDecayRate = lrDecayRate;
+        mlp->LRDecayEpochs = lrDecayEpochs;
+        mlp->EnableEarlyStopping = earlyStop;
+        mlp->EarlyStoppingPatience = patience;
+
+        std::vector<DataPoint> data = LoadDataCSV(dataFile.c_str(), mlp->GetInputSize(), mlp->GetOutputSize());
+        if (data.empty()) { printf("Error: No valid data loaded\n"); delete mlp; return 1; }
+
+        printf("Using GPU: %s\n", prop.name);
+        printf("Loaded %zu training samples\n", data.size());
+        if (batchSize > 1)
+            printf("Note: Batch size %d specified (online training used)\n", batchSize);
+
+        if (normalize) {
+            NormalizeData(data);
+            printf("Data normalized\n");
+        }
+
+        double* output = new double[mlp->GetOutputSize()];
+
+        for (int epoch = 1; epoch <= epochs; epoch++) {
+            ShuffleData(data);
+
+            for (auto& dp : data)
+                mlp->Train(dp.Input.data(), dp.Target.data());
+
+            if (verbose && (epoch % 10 == 0 || epoch == 1)) {
+                double totalLoss = 0;
+                for (auto& dp : data) {
+                    mlp->Predict(dp.Input.data(), output);
+                    totalLoss += mlp->ComputeLoss(output, dp.Target.data());
+                }
+                printf("Epoch %d/%d - Loss: %.6f\n", epoch, epochs, totalLoss / data.size());
+            }
+        }
+
+        double totalLoss = 0;
+        for (auto& dp : data) {
+            mlp->Predict(dp.Input.data(), output);
+            totalLoss += mlp->ComputeLoss(output, dp.Target.data());
+        }
+        printf("Final loss: %.6f\n", totalLoss / data.size());
+
+        delete[] output;
+
+        mlp->Save(saveFile.c_str());
+        printf("Model saved to: %s\n", saveFile.c_str());
+
+        delete mlp;
     }
-    for (int i = 5000; i < 7500; i++) {
-        Data[i].Input[0] = RandomDouble() * 0.5;
-        Data[i].Input[1] = 0.5 + RandomDouble() * 0.5;
-        Data[i].Input[2] = RandomDouble() * 0.5;
-        Data[i].Input[3] = 0.5 + RandomDouble() * 0.5;
-        Data[i].Target[0] = 0; Data[i].Target[1] = 0; Data[i].Target[2] = 1;
+    else if (command == cmdPredict) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (inputValues.empty()) { printf("Error: --input is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        if ((int)inputValues.size() != mlp->GetInputSize()) {
+            printf("Error: Expected %d input values, got %zu\n", mlp->GetInputSize(), inputValues.size());
+            delete mlp;
+            return 1;
+        }
+
+        double* output = new double[mlp->GetOutputSize()];
+        mlp->Predict(inputValues.data(), output);
+
+        printf("Input: ");
+        for (size_t i = 0; i < inputValues.size(); i++)
+            printf("%s%.4f", i > 0 ? ", " : "", inputValues[i]);
+        printf("\n");
+
+        printf("Output: ");
+        for (int i = 0; i < mlp->GetOutputSize(); i++)
+            printf("%s%.6f", i > 0 ? ", " : "", output[i]);
+        printf("\n");
+
+        if (mlp->GetOutputSize() > 1)
+            printf("Max index: %d\n", MaxIndex(output, mlp->GetOutputSize()));
+
+        delete[] output;
+        delete mlp;
     }
+    else if (command == cmdInfo) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
 
-    printf("=== Enhanced MLP CUDA Test ===\n\n");
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
 
-    int HiddenSizes[] = {8, 8, 8};
-    TMultiLayerPerceptronCUDA* MLP = new TMultiLayerPerceptronCUDA(InputSize, HiddenSizes, 3, OutputSize, atSigmoid, atSoftmax);
-    MLP->MaxIterations = 30;
-    MLP->Optimizer = otAdam;
-    MLP->LearningRate = 0.001;
-    MLP->DropoutRate = 0.1;
-    MLP->L2Lambda = 0.0001;
-    MLP->EnableLRDecay = true;
-    MLP->LRDecayRate = 0.95;
-    MLP->LRDecayEpochs = 10;
-    MLP->EnableEarlyStopping = true;
-    MLP->EarlyStoppingPatience = 5;
+        printf("MLP Model Information (CUDA)\n");
+        printf("============================\n");
+        printf("GPU: %s\n", prop.name);
+        printf("Input size: %d\n", mlp->GetInputSize());
+        printf("Output size: %d\n", mlp->GetOutputSize());
+        printf("Hidden layers: %d\n", mlp->GetHiddenLayerCount());
+        printf("Layer sizes: %d", mlp->GetInputSize());
+        for (int h : mlp->GetHiddenSizes())
+            printf(" -> %d", h);
+        printf(" -> %d\n", mlp->GetOutputSize());
+        printf("\n");
+        printf("Hyperparameters:\n");
+        printf("  Learning rate: %.6f\n", mlp->LearningRate);
+        printf("  Optimizer: %s\n", OptimizerToStr(mlp->Optimizer));
+        printf("  Hidden activation: %s\n", ActivationToStr(mlp->HiddenActivation));
+        printf("  Output activation: %s\n", ActivationToStr(mlp->OutputActivation));
+        printf("  Dropout rate: %.4f\n", mlp->DropoutRate);
+        printf("  L2 lambda: %.6f\n", mlp->L2Lambda);
+        printf("  Beta1: %.4f\n", mlp->Beta1);
+        printf("  Beta2: %.4f\n", mlp->Beta2);
+        printf("  Timestep: %d\n", mlp->Timestep);
+        printf("\n");
+        printf("Total layers: %d\n", mlp->GetNumLayers());
+        for (int i = 0; i < mlp->GetNumLayers(); i++)
+            printf("  Layer %d: %d neurons\n", i, mlp->GetLayerSize(i));
 
-    printf("Configuration:\n");
-    printf("  Optimizer: Adam\n");
-    printf("  Hidden Activation: Sigmoid\n");
-    printf("  Output Activation: Softmax\n");
-    printf("  Dropout Rate: %.2f\n", MLP->DropoutRate);
-    printf("  L2 Lambda: %.6f\n", MLP->L2Lambda);
-    printf("  Learning Rate: %.4f\n", MLP->LearningRate);
-    printf("  LR Decay: %.2f every %d epochs\n\n", MLP->LRDecayRate, MLP->LRDecayEpochs);
-
-    printf("Training with early stopping...\n");
-    TrainWithEarlyStopping(MLP, Data, 100, 32);
-    printf("\n");
-
-    double Accuracy = TestAccuracy(MLP, Data);
-
-    double AvgPrecision = 0, AvgRecall = 0, AvgF1 = 0;
-
-    printf("Per-class metrics:\n");
-    for (int c = 0; c < OutputSize; c++) {
-        double ClassPrecision = PrecisionScore(MLP, Data, c);
-        double ClassRecall = RecallScore(MLP, Data, c);
-        double ClassF1 = F1Score(ClassPrecision, ClassRecall);
-        printf("  Class %d: Precision=%.3f Recall=%.3f F1=%.3f\n", c, ClassPrecision, ClassRecall, ClassF1);
-        AvgPrecision += ClassPrecision;
-        AvgRecall += ClassRecall;
-        AvgF1 += ClassF1;
+        delete mlp;
     }
-
-    AvgPrecision /= OutputSize;
-    AvgRecall /= OutputSize;
-    AvgF1 /= OutputSize;
-
-    printf("\nOverall Results:\n");
-    printf("  Accuracy: %.3f\n", Accuracy);
-    printf("  Avg Precision: %.3f\n", AvgPrecision);
-    printf("  Avg Recall: %.3f\n", AvgRecall);
-    printf("  Avg F1 Score: %.3f\n", AvgF1);
-
-    delete MLP;
-    Data.Free();
 
     return 0;
 }
