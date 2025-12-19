@@ -42,7 +42,10 @@ const char MODEL_MAGIC[] = "MLPCUDA1";
 
 enum TActivationType { atSigmoid = 0, atTanh = 1, atReLU = 2, atSoftmax = 3 };
 enum TOptimizerType { otSGD = 0, otAdam = 1, otRMSProp = 2 };
-enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp };
+enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp,
+                cmdGetWeight, cmdSetWeight, cmdGetBias, cmdSetBias,
+                cmdGetOutput, cmdGetError, cmdLayerInfo, cmdHistogram,
+                cmdGetOptimizer, cmdGetWeights, cmdGetAllOutputs };
 
 // Device functions
 __device__ double d_Sigmoid(double x) {
@@ -693,6 +696,233 @@ public:
         fclose(f);
         return mlp;
     }
+
+    // ===== FACADE METHODS =====
+
+    // Get number of weights for a neuron
+    int GetWeightsPerNeuron(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        if (neuronIdx < 0 || neuronIdx >= h_Layers[layerIdx].NumNeurons) return 0;
+        return h_Layers[layerIdx].NumInputs;
+    }
+
+    // Get a specific weight
+    double GetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
+        
+        double value;
+        int idx = neuronIdx * layer.NumInputs + weightIdx;
+        CUDA_CHECK(cudaMemcpy(&value, layer.Weights + idx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Set a specific weight
+    void SetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx, double value) {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return;
+        
+        int idx = neuronIdx * layer.NumInputs + weightIdx;
+        CUDA_CHECK(cudaMemcpy(layer.Weights + idx, &value, sizeof(double), cudaMemcpyHostToDevice));
+    }
+
+    // Get all weights for a neuron
+    std::vector<double> GetNeuronWeights(int layerIdx, int neuronIdx) const {
+        std::vector<double> result;
+        if (layerIdx < 0 || layerIdx >= NumLayers) return result;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return result;
+        
+        result.resize(layer.NumInputs);
+        int idx = neuronIdx * layer.NumInputs;
+        CUDA_CHECK(cudaMemcpy(result.data(), layer.Weights + idx, layer.NumInputs * sizeof(double), cudaMemcpyDeviceToHost));
+        return result;
+    }
+
+    // Get neuron bias
+    double GetNeuronBias(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        
+        double value;
+        CUDA_CHECK(cudaMemcpy(&value, layer.Biases + neuronIdx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Set neuron bias
+    void SetNeuronBias(int layerIdx, int neuronIdx, double value) {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
+        
+        CUDA_CHECK(cudaMemcpy(layer.Biases + neuronIdx, &value, sizeof(double), cudaMemcpyHostToDevice));
+    }
+
+    // Get neuron output
+    double GetNeuronOutput(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        
+        double value;
+        CUDA_CHECK(cudaMemcpy(&value, layer.Outputs + neuronIdx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Get all outputs for a layer
+    std::vector<double> GetLayerOutputs(int layerIdx) const {
+        std::vector<double> result;
+        if (layerIdx < 0 || layerIdx >= NumLayers) return result;
+        LayerData& layer = h_Layers[layerIdx];
+        
+        result.resize(layer.NumNeurons);
+        CUDA_CHECK(cudaMemcpy(result.data(), layer.Outputs, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+        return result;
+    }
+
+    // Get neuron error
+    double GetNeuronError(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        
+        double value;
+        CUDA_CHECK(cudaMemcpy(&value, layer.Errors + neuronIdx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Get all errors for a layer
+    std::vector<double> GetLayerErrors(int layerIdx) const {
+        std::vector<double> result;
+        if (layerIdx < 0 || layerIdx >= NumLayers) return result;
+        LayerData& layer = h_Layers[layerIdx];
+        
+        result.resize(layer.NumNeurons);
+        CUDA_CHECK(cudaMemcpy(result.data(), layer.Errors, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+        return result;
+    }
+
+    // Get optimizer M value for a weight
+    double GetWeightM(int layerIdx, int neuronIdx, int weightIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
+        
+        double value;
+        int idx = neuronIdx * layer.NumInputs + weightIdx;
+        CUDA_CHECK(cudaMemcpy(&value, layer.M + idx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Get optimizer V value for a weight
+    double GetWeightV(int layerIdx, int neuronIdx, int weightIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
+        
+        double value;
+        int idx = neuronIdx * layer.NumInputs + weightIdx;
+        CUDA_CHECK(cudaMemcpy(&value, layer.V + idx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Get bias M value
+    double GetBiasM(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        
+        double value;
+        CUDA_CHECK(cudaMemcpy(&value, layer.MBias + neuronIdx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Get bias V value
+    double GetBiasV(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        
+        double value;
+        CUDA_CHECK(cudaMemcpy(&value, layer.VBias + neuronIdx, sizeof(double), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Get dropout mask for a neuron
+    bool GetDropoutMask(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return false;
+        LayerData& layer = h_Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return false;
+        
+        bool value;
+        CUDA_CHECK(cudaMemcpy(&value, layer.DropoutMask + neuronIdx, sizeof(bool), cudaMemcpyDeviceToHost));
+        return value;
+    }
+
+    // Get layer activation type
+    TActivationType GetLayerActivation(int layerIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return atSigmoid;
+        return h_Layers[layerIdx].ActivationType;
+    }
+
+    // Compute histogram of activations for a layer
+    std::vector<int> GetActivationHistogram(int layerIdx, int numBins = 20) const {
+        std::vector<int> histogram(numBins, 0);
+        if (layerIdx < 0 || layerIdx >= NumLayers) return histogram;
+        
+        std::vector<double> outputs = GetLayerOutputs(layerIdx);
+        if (outputs.empty()) return histogram;
+        
+        double minVal = outputs[0], maxVal = outputs[0];
+        for (double v : outputs) {
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+        }
+        
+        if (maxVal == minVal) maxVal = minVal + 1;
+        double binWidth = (maxVal - minVal) / numBins;
+        
+        for (double v : outputs) {
+            int bin = (int)((v - minVal) / binWidth);
+            if (bin >= numBins) bin = numBins - 1;
+            if (bin < 0) bin = 0;
+            histogram[bin]++;
+        }
+        return histogram;
+    }
+
+    // Compute histogram of gradients/errors for a layer
+    std::vector<int> GetGradientHistogram(int layerIdx, int numBins = 20) const {
+        std::vector<int> histogram(numBins, 0);
+        if (layerIdx < 0 || layerIdx >= NumLayers) return histogram;
+        
+        std::vector<double> errors = GetLayerErrors(layerIdx);
+        if (errors.empty()) return histogram;
+        
+        double minVal = errors[0], maxVal = errors[0];
+        for (double v : errors) {
+            if (v < minVal) minVal = v;
+            if (v > maxVal) maxVal = v;
+        }
+        
+        if (maxVal == minVal) maxVal = minVal + 1;
+        double binWidth = (maxVal - minVal) / numBins;
+        
+        for (double v : errors) {
+            int bin = (int)((v - minVal) / binWidth);
+            if (bin >= numBins) bin = numBins - 1;
+            if (bin < 0) bin = 0;
+            histogram[bin]++;
+        }
+        return histogram;
+    }
 };
 
 // Data structures
@@ -858,11 +1088,44 @@ void PrintUsage() {
     printf("Info Options:\n");
     printf("  --model=FILE           Model file to load (required)\n");
     printf("\n");
+    printf("Facade Commands (inspect/modify model internals):\n");
+    printf("  get-weight   Get a specific weight value\n");
+    printf("  set-weight   Set a specific weight value\n");
+    printf("  get-weights  Get all weights for a neuron\n");
+    printf("  get-bias     Get a neuron's bias\n");
+    printf("  set-bias     Set a neuron's bias\n");
+    printf("  get-output   Get neuron outputs (after predict)\n");
+    printf("  get-error    Get neuron errors (after train step)\n");
+    printf("  layer-info   Show detailed layer information\n");
+    printf("  histogram    Show activation/gradient histogram\n");
+    printf("  get-optimizer Get optimizer state (M/V values)\n");
+    printf("\n");
+    printf("Facade Options:\n");
+    printf("  --model=FILE           Model file (required)\n");
+    printf("  --layer=N              Layer index (0=input, 1+=hidden, last=output)\n");
+    printf("  --neuron=N             Neuron index within layer\n");
+    printf("  --weight=N             Weight index within neuron\n");
+    printf("  --value=V              Value to set\n");
+    printf("  --save=FILE            Save modified model\n");
+    printf("  --type=TYPE            Histogram type: activation|gradient\n");
+    printf("  --bins=N               Number of histogram bins (default: 20)\n");
+    printf("  --run-input=v1,v2,...  Run prediction first (for get-output)\n");
+    printf("\n");
     printf("Examples:\n");
     printf("  mlpcuda create --input=2 --hidden=4,4 --output=1 --save=xor.bin\n");
     printf("  mlpcuda train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin\n");
     printf("  mlpcuda predict --model=xor_trained.bin --input=1,0\n");
     printf("  mlpcuda info --model=xor_trained.bin\n");
+    printf("\n");
+    printf("Facade Examples:\n");
+    printf("  mlpcuda get-weight --model=m.bin --layer=1 --neuron=0 --weight=2\n");
+    printf("  mlpcuda set-weight --model=m.bin --layer=1 --neuron=0 --weight=2 --value=0.5 --save=m.bin\n");
+    printf("  mlpcuda get-weights --model=m.bin --layer=1 --neuron=0\n");
+    printf("  mlpcuda get-bias --model=m.bin --layer=1 --neuron=0\n");
+    printf("  mlpcuda get-output --model=m.bin --layer=1 --run-input=1,0\n");
+    printf("  mlpcuda layer-info --model=m.bin --layer=1\n");
+    printf("  mlpcuda histogram --model=m.bin --layer=1 --type=activation --run-input=1,0\n");
+    printf("  mlpcuda get-optimizer --model=m.bin --layer=1 --neuron=0 --weight=0\n");
 }
 
 int main(int argc, char** argv) {
@@ -880,6 +1143,17 @@ int main(int argc, char** argv) {
     else if (cmdStr == "predict") command = cmdPredict;
     else if (cmdStr == "info") command = cmdInfo;
     else if (cmdStr == "help" || cmdStr == "--help" || cmdStr == "-h") command = cmdHelp;
+    else if (cmdStr == "get-weight") command = cmdGetWeight;
+    else if (cmdStr == "set-weight") command = cmdSetWeight;
+    else if (cmdStr == "get-weights") command = cmdGetWeights;
+    else if (cmdStr == "get-bias") command = cmdGetBias;
+    else if (cmdStr == "set-bias") command = cmdSetBias;
+    else if (cmdStr == "get-output") command = cmdGetOutput;
+    else if (cmdStr == "get-outputs") command = cmdGetAllOutputs;
+    else if (cmdStr == "get-error") command = cmdGetError;
+    else if (cmdStr == "layer-info") command = cmdLayerInfo;
+    else if (cmdStr == "histogram") command = cmdHistogram;
+    else if (cmdStr == "get-optimizer") command = cmdGetOptimizer;
     else {
         printf("Unknown command: %s\n", argv[1]);
         PrintUsage();
@@ -905,6 +1179,14 @@ int main(int argc, char** argv) {
     double lrDecayRate = 0.95;
     int lrDecayEpochs = 10, patience = 10;
     bool lrOverride = false;
+    
+    // Facade arguments
+    int layerIdx = -1, neuronIdx = -1, weightIdx = -1;
+    double setValue = 0;
+    bool hasSetValue = false;
+    std::string histogramType = "activation";
+    int histogramBins = 20;
+    std::vector<double> runInput;
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -947,6 +1229,14 @@ int main(int argc, char** argv) {
         else if (key == "--lr-decay-rate") lrDecayRate = atof(value.c_str());
         else if (key == "--lr-decay-epochs") lrDecayEpochs = atoi(value.c_str());
         else if (key == "--patience") patience = atoi(value.c_str());
+        // Facade arguments
+        else if (key == "--layer") layerIdx = atoi(value.c_str());
+        else if (key == "--neuron") neuronIdx = atoi(value.c_str());
+        else if (key == "--weight") weightIdx = atoi(value.c_str());
+        else if (key == "--value") { setValue = atof(value.c_str()); hasSetValue = true; }
+        else if (key == "--type") histogramType = value;
+        else if (key == "--bins") histogramBins = atoi(value.c_str());
+        else if (key == "--run-input") runInput = ParseDoubleArray(value.c_str());
         else printf("Unknown option: %s\n", key.c_str());
     }
 
@@ -1117,6 +1407,262 @@ int main(int argc, char** argv) {
         printf("Total layers: %d\n", mlp->GetNumLayers());
         for (int i = 0; i < mlp->GetNumLayers(); i++)
             printf("  Layer %d: %d neurons\n", i, mlp->GetLayerSize(i));
+
+        delete mlp;
+    }
+    // ===== FACADE COMMANDS =====
+    else if (command == cmdGetWeight) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+        if (neuronIdx < 0) { printf("Error: --neuron is required\n"); return 1; }
+        if (weightIdx < 0) { printf("Error: --weight is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        double w = mlp->GetNeuronWeight(layerIdx, neuronIdx, weightIdx);
+        printf("Weight[layer=%d, neuron=%d, weight=%d] = %.10f\n", layerIdx, neuronIdx, weightIdx, w);
+
+        delete mlp;
+    }
+    else if (command == cmdSetWeight) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+        if (neuronIdx < 0) { printf("Error: --neuron is required\n"); return 1; }
+        if (weightIdx < 0) { printf("Error: --weight is required\n"); return 1; }
+        if (!hasSetValue) { printf("Error: --value is required\n"); return 1; }
+        if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        double oldVal = mlp->GetNeuronWeight(layerIdx, neuronIdx, weightIdx);
+        mlp->SetNeuronWeight(layerIdx, neuronIdx, weightIdx, setValue);
+        mlp->Save(saveFile.c_str());
+        printf("Weight[layer=%d, neuron=%d, weight=%d]: %.10f -> %.10f\n", 
+               layerIdx, neuronIdx, weightIdx, oldVal, setValue);
+        printf("Saved to: %s\n", saveFile.c_str());
+
+        delete mlp;
+    }
+    else if (command == cmdGetWeights) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+        if (neuronIdx < 0) { printf("Error: --neuron is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        std::vector<double> weights = mlp->GetNeuronWeights(layerIdx, neuronIdx);
+        printf("Weights[layer=%d, neuron=%d] (%zu weights):\n", layerIdx, neuronIdx, weights.size());
+        for (size_t i = 0; i < weights.size(); i++)
+            printf("  [%zu] = %.10f\n", i, weights[i]);
+
+        delete mlp;
+    }
+    else if (command == cmdGetBias) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+        if (neuronIdx < 0) { printf("Error: --neuron is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        double b = mlp->GetNeuronBias(layerIdx, neuronIdx);
+        printf("Bias[layer=%d, neuron=%d] = %.10f\n", layerIdx, neuronIdx, b);
+
+        delete mlp;
+    }
+    else if (command == cmdSetBias) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+        if (neuronIdx < 0) { printf("Error: --neuron is required\n"); return 1; }
+        if (!hasSetValue) { printf("Error: --value is required\n"); return 1; }
+        if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        double oldVal = mlp->GetNeuronBias(layerIdx, neuronIdx);
+        mlp->SetNeuronBias(layerIdx, neuronIdx, setValue);
+        mlp->Save(saveFile.c_str());
+        printf("Bias[layer=%d, neuron=%d]: %.10f -> %.10f\n", layerIdx, neuronIdx, oldVal, setValue);
+        printf("Saved to: %s\n", saveFile.c_str());
+
+        delete mlp;
+    }
+    else if (command == cmdGetOutput) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        if (!runInput.empty()) {
+            if ((int)runInput.size() != mlp->GetInputSize()) {
+                printf("Error: --run-input needs %d values\n", mlp->GetInputSize());
+                delete mlp;
+                return 1;
+            }
+            double* output = new double[mlp->GetOutputSize()];
+            mlp->Predict(runInput.data(), output);
+            delete[] output;
+        }
+
+        std::vector<double> outputs = mlp->GetLayerOutputs(layerIdx);
+        printf("Outputs[layer=%d] (%zu neurons):\n", layerIdx, outputs.size());
+        for (size_t i = 0; i < outputs.size(); i++)
+            printf("  [%zu] = %.10f\n", i, outputs[i]);
+
+        delete mlp;
+    }
+    else if (command == cmdGetAllOutputs) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        if (!runInput.empty()) {
+            if ((int)runInput.size() != mlp->GetInputSize()) {
+                printf("Error: --run-input needs %d values\n", mlp->GetInputSize());
+                delete mlp;
+                return 1;
+            }
+            double* output = new double[mlp->GetOutputSize()];
+            mlp->Predict(runInput.data(), output);
+            delete[] output;
+        }
+
+        for (int l = 0; l < mlp->GetNumLayers(); l++) {
+            std::vector<double> outputs = mlp->GetLayerOutputs(l);
+            printf("Layer %d (%zu neurons):\n", l, outputs.size());
+            for (size_t i = 0; i < outputs.size(); i++)
+                printf("  [%zu] = %.6f\n", i, outputs[i]);
+        }
+
+        delete mlp;
+    }
+    else if (command == cmdGetError) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        std::vector<double> errors = mlp->GetLayerErrors(layerIdx);
+        printf("Errors[layer=%d] (%zu neurons):\n", layerIdx, errors.size());
+        for (size_t i = 0; i < errors.size(); i++)
+            printf("  [%zu] = %.10f\n", i, errors[i]);
+
+        delete mlp;
+    }
+    else if (command == cmdLayerInfo) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        int numNeurons = mlp->GetLayerSize(layerIdx);
+        int numWeights = (layerIdx > 0 && numNeurons > 0) ? mlp->GetWeightsPerNeuron(layerIdx, 0) : 0;
+        
+        printf("Layer %d Information:\n", layerIdx);
+        printf("  Neurons: %d\n", numNeurons);
+        printf("  Weights per neuron: %d\n", numWeights);
+        printf("  Activation: %s\n", ActivationToStr(mlp->GetLayerActivation(layerIdx)));
+        printf("\n");
+
+        if (!runInput.empty()) {
+            if ((int)runInput.size() != mlp->GetInputSize()) {
+                printf("Warning: --run-input needs %d values, skipping outputs\n", mlp->GetInputSize());
+            } else {
+                double* output = new double[mlp->GetOutputSize()];
+                mlp->Predict(runInput.data(), output);
+                delete[] output;
+
+                std::vector<double> outputs = mlp->GetLayerOutputs(layerIdx);
+                printf("  Neuron outputs (after prediction):\n");
+                for (size_t i = 0; i < outputs.size(); i++)
+                    printf("    [%zu] = %.6f\n", i, outputs[i]);
+            }
+        }
+
+        printf("\n  Neuron details:\n");
+        for (int n = 0; n < numNeurons && n < 10; n++) {
+            double bias = mlp->GetNeuronBias(layerIdx, n);
+            printf("    Neuron %d: bias=%.6f\n", n, bias);
+        }
+        if (numNeurons > 10) printf("    ... (%d more neurons)\n", numNeurons - 10);
+
+        delete mlp;
+    }
+    else if (command == cmdHistogram) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        if (!runInput.empty()) {
+            if ((int)runInput.size() != mlp->GetInputSize()) {
+                printf("Error: --run-input needs %d values\n", mlp->GetInputSize());
+                delete mlp;
+                return 1;
+            }
+            double* output = new double[mlp->GetOutputSize()];
+            mlp->Predict(runInput.data(), output);
+            delete[] output;
+        }
+
+        std::vector<int> histogram;
+        if (histogramType == "gradient" || histogramType == "error") {
+            histogram = mlp->GetGradientHistogram(layerIdx, histogramBins);
+            printf("Gradient Histogram [layer=%d] (%d bins):\n", layerIdx, histogramBins);
+        } else {
+            histogram = mlp->GetActivationHistogram(layerIdx, histogramBins);
+            printf("Activation Histogram [layer=%d] (%d bins):\n", layerIdx, histogramBins);
+        }
+
+        int maxCount = 0;
+        for (int c : histogram) if (c > maxCount) maxCount = c;
+
+        for (int i = 0; i < (int)histogram.size(); i++) {
+            int barLen = (maxCount > 0) ? (histogram[i] * 40 / maxCount) : 0;
+            printf("  [%2d] %4d |", i, histogram[i]);
+            for (int j = 0; j < barLen; j++) printf("#");
+            printf("\n");
+        }
+
+        delete mlp;
+    }
+    else if (command == cmdGetOptimizer) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer is required\n"); return 1; }
+        if (neuronIdx < 0) { printf("Error: --neuron is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        printf("Optimizer state [layer=%d, neuron=%d]:\n", layerIdx, neuronIdx);
+        printf("  Optimizer: %s\n", OptimizerToStr(mlp->Optimizer));
+        printf("  Timestep: %d\n", mlp->Timestep);
+        printf("  Bias M: %.10f\n", mlp->GetBiasM(layerIdx, neuronIdx));
+        printf("  Bias V: %.10f\n", mlp->GetBiasV(layerIdx, neuronIdx));
+
+        if (weightIdx >= 0) {
+            printf("\n  Weight[%d]:\n", weightIdx);
+            printf("    M: %.10f\n", mlp->GetWeightM(layerIdx, neuronIdx, weightIdx));
+            printf("    V: %.10f\n", mlp->GetWeightV(layerIdx, neuronIdx, weightIdx));
+        } else {
+            int numWeights = mlp->GetWeightsPerNeuron(layerIdx, neuronIdx);
+            printf("\n  All weights (%d):\n", numWeights);
+            for (int w = 0; w < numWeights && w < 10; w++) {
+                printf("    [%d] M=%.6f V=%.6f\n", w, 
+                       mlp->GetWeightM(layerIdx, neuronIdx, w),
+                       mlp->GetWeightV(layerIdx, neuronIdx, w));
+            }
+            if (numWeights > 10) printf("    ... (%d more)\n", numWeights - 10);
+        }
 
         delete mlp;
     }
