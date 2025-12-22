@@ -8,7 +8,7 @@ MIT Licensed | GPU Powered | CLI & Facade | Open and Hackable
 
 ## What is GlassBoxAI-MLP?
 
-**A high-performance, fully-transparent, and extendable neural network toolkit in C++ & CUDA, designed for:**
+**A high-performance, fully-transparent, and extendable neural network toolkit in C++ & CUDA or OpenCL, designed for:**
 - **Speed** (GPU-accelerated learning and inference)
 - **Transparency** (inspect, modify, and audit *everything*)
 - **Hackability** (facade pattern, CLI scripting, direct weight/optimizer access)
