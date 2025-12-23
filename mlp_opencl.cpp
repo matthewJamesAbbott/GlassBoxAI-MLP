@@ -6,7 +6,7 @@
 //
 // Matthew Abbott 2025
 //
-// Compile: 
+// Compile:
 //   g++ -o mlp_opencl mlp_opencl.cpp -lOpenCL -std=c++11
 //
 // Usage: Same as CUDA version
@@ -37,7 +37,7 @@
         } \
     } while(0)
 
-const double EPSILON = 1e-15;
+const float EPSILON = 1e-15;
 const int BLOCK_SIZE = 256;
 const char MODEL_MAGIC[] = "MLPOCL01";
 
@@ -48,57 +48,57 @@ enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp };
 // OpenCL kernel source code
 const char* kernelSource = R"CLC(
 
-double d_Sigmoid(double x) {
-    if (x < -500) return 0.0;
-    else if (x > 500) return 1.0;
-    else return 1.0 / (1.0 + exp(-x));
+float d_Sigmoid(float x) {
+    if (x < -500.0f) return 0.0f;
+    else if (x > 500.0f) return 1.0f;
+    else return 1.0f / (1.0f + exp(-x));
 }
 
-double d_DSigmoid(double x) {
-    return x * (1.0 - x);
+float d_DSigmoid(float x) {
+    return x * (1.0f - x);
 }
 
-double d_TanhActivation(double x) {
+float d_TanhActivation(float x) {
     return tanh(x);
 }
 
-double d_DTanh(double x) {
-    return 1.0 - (x * x);
+float d_DTanh(float x) {
+    return 1.0f - (x * x);
 }
 
-double d_ReLU(double x) {
-    return (x > 0) ? x : 0.0;
+float d_ReLU(float x) {
+    return (x > 0.0f) ? x : 0.0f;
 }
 
-double d_DReLU(double x) {
-    return (x > 0) ? 1.0 : 0.0;
+float d_DReLU(float x) {
+    return (x > 0.0f) ? 1.0f : 0.0f;
 }
 
-double d_ApplyActivation(double x, int ActType) {
+float d_ApplyActivation(float x, int ActType) {
     if (ActType == 0) return d_Sigmoid(x);
     else if (ActType == 1) return d_TanhActivation(x);
     else if (ActType == 2) return d_ReLU(x);
     else return d_Sigmoid(x);
 }
 
-double d_ApplyActivationDerivative(double x, int ActType) {
+float d_ApplyActivationDerivative(float x, int ActType) {
     if (ActType == 0) return d_DSigmoid(x);
     else if (ActType == 1) return d_DTanh(x);
     else if (ActType == 2) return d_DReLU(x);
     else return d_DSigmoid(x);
 }
 
-__kernel void FeedForwardKernel(__global double* weights,
-                                 __global double* biases,
-                                 __global double* outputs,
-                                 __global double* prevOutputs,
+__kernel void FeedForwardKernel(__global float* weights,
+                                 __global float* biases,
+                                 __global float* outputs,
+                                 __global float* prevOutputs,
                                  int numNeurons,
                                  int numInputs,
                                  int prevSize,
                                  int activationType) {
     int i = get_global_id(0);
     if (i < numNeurons) {
-        double sum = biases[i];
+        float sum = biases[i];
         for (int j = 0; j < prevSize; j++) {
             sum += prevOutputs[j] * weights[i * numInputs + j];
         }
@@ -106,16 +106,16 @@ __kernel void FeedForwardKernel(__global double* weights,
     }
 }
 
-__kernel void FeedForwardSoftmaxSumKernel(__global double* weights,
-                                           __global double* biases,
-                                           __global double* sums,
-                                           __global double* prevOutputs,
+__kernel void FeedForwardSoftmaxSumKernel(__global float* weights,
+                                           __global float* biases,
+                                           __global float* sums,
+                                           __global float* prevOutputs,
                                            int numNeurons,
                                            int numInputs,
                                            int prevSize) {
     int i = get_global_id(0);
     if (i < numNeurons) {
-        double sum = biases[i];
+        float sum = biases[i];
         for (int j = 0; j < prevSize; j++) {
             sum += prevOutputs[j] * weights[i * numInputs + j];
         }
@@ -123,16 +123,16 @@ __kernel void FeedForwardSoftmaxSumKernel(__global double* weights,
     }
 }
 
-__kernel void SoftmaxKernel(__global double* sums,
-                            __global double* outputs,
+__kernel void SoftmaxKernel(__global float* sums,
+                            __global float* outputs,
                             int n,
-                            double maxVal,
-                            double sumExp) {
+                            float maxVal,
+                            float sumExp) {
     int i = get_global_id(0);
     if (i < n) {
-        double val = exp(sums[i] - maxVal) / sumExp;
-        if (val < 1e-15) val = 1e-15;
-        else if (val > 1.0 - 1e-15) val = 1.0 - 1e-15;
+        float val = exp(sums[i] - maxVal) / sumExp;
+        if (val < 1e-15f) val = 1e-15f;
+        else if (val > 1.0f - 1e-15f) val = 1.0f - 1e-15f;
         outputs[i] = val;
     }
 }
@@ -144,18 +144,18 @@ unsigned int lcg_rand(unsigned int seed) {
 
 float lcg_uniform(unsigned int* seed) {
     *seed = lcg_rand(*seed);
-    return (float)(*seed) / 4294967296.0f;
+    return ((float)(*seed)) / 4294967296.0f;
 }
 
-__kernel void ApplyDropoutKernel(__global double* outputs,
+__kernel void ApplyDropoutKernel(__global float* outputs,
                                   __global uchar* dropoutMask,
                                   int numNeurons,
-                                  double dropoutRate,
-                                  double scale,
+                                  float dropoutRate,
+                                  float scale,
                                   unsigned int seed) {
     int i = get_global_id(0);
     if (i < numNeurons) {
-        if (dropoutRate <= 0) {
+        if (dropoutRate <= 0.0f) {
             dropoutMask[i] = 1;
             return;
         }
@@ -166,14 +166,14 @@ __kernel void ApplyDropoutKernel(__global double* outputs,
             outputs[i] = outputs[i] * scale;
         } else {
             dropoutMask[i] = 0;
-            outputs[i] = 0.0;
+            outputs[i] = 0.0f;
         }
     }
 }
 
-__kernel void BackPropOutputKernel(__global double* errors,
-                                    __global double* outputs,
-                                    __global double* target,
+__kernel void BackPropOutputKernel(__global float* errors,
+                                    __global float* outputs,
+                                    __global float* target,
                                     int numNeurons,
                                     int activationType,
                                     int isSoftmax) {
@@ -188,11 +188,11 @@ __kernel void BackPropOutputKernel(__global double* errors,
     }
 }
 
-__kernel void BackPropHiddenKernel(__global double* errors,
-                                    __global double* outputs,
+__kernel void BackPropHiddenKernel(__global float* errors,
+                                    __global float* outputs,
                                     __global uchar* dropoutMask,
-                                    __global double* nextErrors,
-                                    __global double* nextWeights,
+                                    __global float* nextErrors,
+                                    __global float* nextWeights,
                                     int numNeurons,
                                     int activationType,
                                     int nextNumNeurons,
@@ -200,10 +200,10 @@ __kernel void BackPropHiddenKernel(__global double* errors,
     int i = get_global_id(0);
     if (i < numNeurons) {
         if (dropoutMask[i] == 0) {
-            errors[i] = 0.0;
+            errors[i] = 0.0f;
             return;
         }
-        double errorSum = 0.0;
+        float errorSum = 0.0f;
         for (int j = 0; j < nextNumNeurons; j++) {
             errorSum += nextErrors[j] * nextWeights[j * nextNumInputs + i];
         }
@@ -211,19 +211,19 @@ __kernel void BackPropHiddenKernel(__global double* errors,
     }
 }
 
-__kernel void UpdateWeightsSGDKernel(__global double* weights,
-                                      __global double* biases,
-                                      __global double* errors,
-                                      __global double* prevOutputs,
+__kernel void UpdateWeightsSGDKernel(__global float* weights,
+                                      __global float* biases,
+                                      __global float* errors,
+                                      __global float* prevOutputs,
                                       int numNeurons,
                                       int numInputs,
-                                      double learningRate,
-                                      double l2Lambda) {
+                                      float learningRate,
+                                      float l2Lambda) {
     int i = get_global_id(0);
     if (i < numNeurons) {
         for (int j = 0; j < numInputs; j++) {
-            double gradient = errors[i] * prevOutputs[j];
-            if (l2Lambda > 0)
+            float gradient = errors[i] * prevOutputs[j];
+            if (l2Lambda > 0.0f)
                 gradient = gradient - l2Lambda * weights[i * numInputs + j];
             weights[i * numInputs + j] += learningRate * gradient;
         }
@@ -231,78 +231,78 @@ __kernel void UpdateWeightsSGDKernel(__global double* weights,
     }
 }
 
-__kernel void UpdateWeightsAdamKernel(__global double* weights,
-                                       __global double* biases,
-                                       __global double* errors,
-                                       __global double* prevOutputs,
-                                       __global double* M,
-                                       __global double* V,
-                                       __global double* MBias,
-                                       __global double* VBias,
+__kernel void UpdateWeightsAdamKernel(__global float* weights,
+                                       __global float* biases,
+                                       __global float* errors,
+                                       __global float* prevOutputs,
+                                       __global float* M,
+                                       __global float* V,
+                                       __global float* MBias,
+                                       __global float* VBias,
                                        int numNeurons,
                                        int numInputs,
-                                       double learningRate,
-                                       double l2Lambda,
-                                       double beta1,
-                                       double beta2,
+                                       float learningRate,
+                                       float l2Lambda,
+                                       float beta1,
+                                       float beta2,
                                        int timestep) {
     int i = get_global_id(0);
     if (i < numNeurons) {
-        double eps = 1e-8;
-        double beta1_t = pow(beta1, (double)timestep);
-        double beta2_t = pow(beta2, (double)timestep);
+        float eps = 1e-8f;
+        float beta1_t = pow(beta1, (float)timestep);
+        float beta2_t = pow(beta2, (float)timestep);
 
         for (int j = 0; j < numInputs; j++) {
             int idx = i * numInputs + j;
-            double gradient = -errors[i] * prevOutputs[j];
-            if (l2Lambda > 0)
+            float gradient = -errors[i] * prevOutputs[j];
+            if (l2Lambda > 0.0f)
                 gradient += l2Lambda * weights[idx];
 
-            M[idx] = beta1 * M[idx] + (1.0 - beta1) * gradient;
-            V[idx] = beta2 * V[idx] + (1.0 - beta2) * gradient * gradient;
+            M[idx] = beta1 * M[idx] + (1.0f - beta1) * gradient;
+            V[idx] = beta2 * V[idx] + (1.0f - beta2) * gradient * gradient;
 
-            double mHat = M[idx] / (1.0 - beta1_t);
-            double vHat = V[idx] / (1.0 - beta2_t);
+            float mHat = M[idx] / (1.0f - beta1_t);
+            float vHat = V[idx] / (1.0f - beta2_t);
 
             weights[idx] -= learningRate * mHat / (sqrt(vHat) + eps);
         }
 
-        double gradient = -errors[i];
-        MBias[i] = beta1 * MBias[i] + (1.0 - beta1) * gradient;
-        VBias[i] = beta2 * VBias[i] + (1.0 - beta2) * gradient * gradient;
-        double mHat = MBias[i] / (1.0 - beta1_t);
-        double vHat = VBias[i] / (1.0 - beta2_t);
+        float gradient = -errors[i];
+        MBias[i] = beta1 * MBias[i] + (1.0f - beta1) * gradient;
+        VBias[i] = beta2 * VBias[i] + (1.0f - beta2) * gradient * gradient;
+        float mHat = MBias[i] / (1.0f - beta1_t);
+        float vHat = VBias[i] / (1.0f - beta2_t);
         biases[i] -= learningRate * mHat / (sqrt(vHat) + eps);
     }
 }
 
-__kernel void UpdateWeightsRMSPropKernel(__global double* weights,
-                                          __global double* biases,
-                                          __global double* errors,
-                                          __global double* prevOutputs,
-                                          __global double* V,
-                                          __global double* VBias,
+__kernel void UpdateWeightsRMSPropKernel(__global float* weights,
+                                          __global float* biases,
+                                          __global float* errors,
+                                          __global float* prevOutputs,
+                                          __global float* V,
+                                          __global float* VBias,
                                           int numNeurons,
                                           int numInputs,
-                                          double learningRate,
-                                          double l2Lambda) {
+                                          float learningRate,
+                                          float l2Lambda) {
     int i = get_global_id(0);
     if (i < numNeurons) {
-        double eps = 1e-8;
-        double decay = 0.9;
+        float eps = 1e-8f;
+        float decay = 0.9f;
 
         for (int j = 0; j < numInputs; j++) {
             int idx = i * numInputs + j;
-            double gradient = -errors[i] * prevOutputs[j];
-            if (l2Lambda > 0)
+            float gradient = -errors[i] * prevOutputs[j];
+            if (l2Lambda > 0.0f)
                 gradient += l2Lambda * weights[idx];
 
-            V[idx] = decay * V[idx] + (1.0 - decay) * gradient * gradient;
+            V[idx] = decay * V[idx] + (1.0f - decay) * gradient * gradient;
             weights[idx] -= learningRate * gradient / (sqrt(V[idx]) + eps);
         }
 
-        double gradient = -errors[i];
-        VBias[i] = decay * VBias[i] + (1.0 - decay) * gradient * gradient;
+        float gradient = -errors[i];
+        VBias[i] = decay * VBias[i] + (1.0f - decay) * gradient * gradient;
         biases[i] -= learningRate * gradient / (sqrt(VBias[i]) + eps);
     }
 }
@@ -329,7 +329,7 @@ private:
     cl_context context;
     cl_command_queue queue;
     cl_program program;
-    
+
     cl_kernel feedForwardKernel;
     cl_kernel feedForwardSoftmaxSumKernel;
     cl_kernel softmaxKernel;
@@ -339,7 +339,7 @@ private:
     cl_kernel updateWeightsSGDKernel;
     cl_kernel updateWeightsAdamKernel;
     cl_kernel updateWeightsRMSPropKernel;
-    
+
     LayerData* Layers;
     int NumLayers;
     int FInputSize;
@@ -355,25 +355,25 @@ private:
         cl_int err;
         cl_platform_id platform;
         cl_device_id device;
-        
+
         err = clGetPlatformIDs(1, &platform, NULL);
         CL_CHECK(err);
-        
+
         err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
         if (err != CL_SUCCESS) {
             err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL);
         }
         CL_CHECK(err);
-        
+
         context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
         CL_CHECK(err);
-        
+
         queue = clCreateCommandQueue(context, device, 0, &err);
         CL_CHECK(err);
-        
+
         program = clCreateProgramWithSource(context, 1, &kernelSource, NULL, &err);
         CL_CHECK(err);
-        
+
         err = clBuildProgram(program, 1, &device, "-cl-std=CL1.2", NULL, NULL);
         if (err != CL_SUCCESS) {
             size_t len;
@@ -382,7 +382,7 @@ private:
             printf("Build error:\n%s\n", buffer);
             exit(1);
         }
-        
+
         feedForwardKernel = clCreateKernel(program, "FeedForwardKernel", &err);
         CL_CHECK(err);
         feedForwardSoftmaxSumKernel = clCreateKernel(program, "FeedForwardSoftmaxSumKernel", &err);
@@ -410,43 +410,43 @@ private:
         layer.ActivationType = actType;
 
         int weightSize = numNeurons * numInputs;
-        layer.Weights = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(double), NULL, &err);
+        layer.Weights = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        layer.Biases = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(double), NULL, &err);
+        layer.Biases = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        layer.Outputs = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(double), NULL, &err);
+        layer.Outputs = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        layer.Errors = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(double), NULL, &err);
+        layer.Errors = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        layer.M = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(double), NULL, &err);
+        layer.M = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        layer.V = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(double), NULL, &err);
+        layer.V = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        layer.MBias = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(double), NULL, &err);
+        layer.MBias = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        layer.VBias = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(double), NULL, &err);
+        layer.VBias = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
         CL_CHECK(err);
         layer.DropoutMask = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(unsigned char), NULL, &err);
         CL_CHECK(err);
 
-        double* zeros = new double[std::max(weightSize, numNeurons)]();
-        clEnqueueWriteBuffer(queue, layer.Biases, CL_TRUE, 0, numNeurons * sizeof(double), zeros, 0, NULL, NULL);
-        clEnqueueWriteBuffer(queue, layer.M, CL_TRUE, 0, weightSize * sizeof(double), zeros, 0, NULL, NULL);
-        clEnqueueWriteBuffer(queue, layer.V, CL_TRUE, 0, weightSize * sizeof(double), zeros, 0, NULL, NULL);
-        clEnqueueWriteBuffer(queue, layer.MBias, CL_TRUE, 0, numNeurons * sizeof(double), zeros, 0, NULL, NULL);
-        clEnqueueWriteBuffer(queue, layer.VBias, CL_TRUE, 0, numNeurons * sizeof(double), zeros, 0, NULL, NULL);
+        float* zeros = new float[std::max(weightSize, numNeurons)]();
+        clEnqueueWriteBuffer(queue, layer.Biases, CL_TRUE, 0, numNeurons * sizeof(float), zeros, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, layer.M, CL_TRUE, 0, weightSize * sizeof(float), zeros, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, layer.V, CL_TRUE, 0, weightSize * sizeof(float), zeros, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, layer.MBias, CL_TRUE, 0, numNeurons * sizeof(float), zeros, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, layer.VBias, CL_TRUE, 0, numNeurons * sizeof(float), zeros, 0, NULL, NULL);
         delete[] zeros;
 
-        double limit;
+        float limit;
         if (actType == atReLU)
             limit = sqrt(2.0 / numInputs);
         else
             limit = sqrt(6.0 / (numInputs + numNeurons));
 
-        double* h_weights = new double[weightSize];
+        float* h_weights = new float[weightSize];
         for (int i = 0; i < weightSize; i++)
-            h_weights[i] = ((double)rand() / RAND_MAX * 2 - 1) * limit;
-        clEnqueueWriteBuffer(queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(double), h_weights, 0, NULL, NULL);
+            h_weights[i] = ((float)rand() / RAND_MAX * 2 - 1) * limit;
+        clEnqueueWriteBuffer(queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(float), h_weights, 0, NULL, NULL);
         delete[] h_weights;
 
         unsigned char* h_mask = new unsigned char[numNeurons];
@@ -468,18 +468,18 @@ private:
     }
 
 public:
-    double LearningRate;
+    float LearningRate;
     int MaxIterations;
     TOptimizerType Optimizer;
     TActivationType HiddenActivation;
     TActivationType OutputActivation;
-    double DropoutRate;
-    double L2Lambda;
-    double Beta1;
-    double Beta2;
+    float DropoutRate;
+    float L2Lambda;
+    float Beta1;
+    float Beta2;
     int Timestep;
     bool EnableLRDecay;
-    double LRDecayRate;
+    float LRDecayRate;
     int LRDecayEpochs;
     bool EnableEarlyStopping;
     int EarlyStoppingPatience;
@@ -527,9 +527,9 @@ public:
         if (OutputSize > MaxNeurons) MaxNeurons = OutputSize;
 
         cl_int err;
-        d_Target = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(double), NULL, &err);
+        d_Target = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
         CL_CHECK(err);
-        d_SoftmaxSums = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(double), NULL, &err);
+        d_SoftmaxSums = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
         CL_CHECK(err);
     }
 
@@ -537,10 +537,10 @@ public:
         for (int i = 0; i < NumLayers; i++)
             FreeLayer(Layers[i]);
         delete[] Layers;
-        
+
         clReleaseMemObject(d_Target);
         clReleaseMemObject(d_SoftmaxSums);
-        
+
         clReleaseKernel(feedForwardKernel);
         clReleaseKernel(feedForwardSoftmaxSumKernel);
         clReleaseKernel(softmaxKernel);
@@ -550,7 +550,7 @@ public:
         clReleaseKernel(updateWeightsSGDKernel);
         clReleaseKernel(updateWeightsAdamKernel);
         clReleaseKernel(updateWeightsRMSPropKernel);
-        
+
         clReleaseProgram(program);
         clReleaseCommandQueue(queue);
         clReleaseContext(context);
@@ -558,13 +558,13 @@ public:
 
     void FeedForward() {
         cl_int err;
-        
+
         for (int k = 1; k < NumLayers - 1; k++) {
             LayerData& layer = Layers[k];
             LayerData& prevLayer = Layers[k - 1];
 
             size_t globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            
+
             clSetKernelArg(feedForwardKernel, 0, sizeof(cl_mem), &layer.Weights);
             clSetKernelArg(feedForwardKernel, 1, sizeof(cl_mem), &layer.Biases);
             clSetKernelArg(feedForwardKernel, 2, sizeof(cl_mem), &layer.Outputs);
@@ -574,21 +574,21 @@ public:
             clSetKernelArg(feedForwardKernel, 6, sizeof(int), &prevLayer.NumNeurons);
             int actType = (int)layer.ActivationType;
             clSetKernelArg(feedForwardKernel, 7, sizeof(int), &actType);
-            
+
             err = clEnqueueNDRangeKernel(queue, feedForwardKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
             CL_CHECK(err);
 
             if (FIsTraining && DropoutRate > 0) {
-                double scale = 1.0 / (1.0 - DropoutRate);
+                float scale = 1.0 / (1.0 - DropoutRate);
                 unsigned int seed = (unsigned int)(time(NULL) + k);
-                
+
                 clSetKernelArg(applyDropoutKernel, 0, sizeof(cl_mem), &layer.Outputs);
                 clSetKernelArg(applyDropoutKernel, 1, sizeof(cl_mem), &layer.DropoutMask);
                 clSetKernelArg(applyDropoutKernel, 2, sizeof(int), &layer.NumNeurons);
-                clSetKernelArg(applyDropoutKernel, 3, sizeof(double), &DropoutRate);
-                clSetKernelArg(applyDropoutKernel, 4, sizeof(double), &scale);
+                clSetKernelArg(applyDropoutKernel, 3, sizeof(float), &DropoutRate);
+                clSetKernelArg(applyDropoutKernel, 4, sizeof(float), &scale);
                 clSetKernelArg(applyDropoutKernel, 5, sizeof(unsigned int), &seed);
-                
+
                 err = clEnqueueNDRangeKernel(queue, applyDropoutKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
                 CL_CHECK(err);
             }
@@ -606,19 +606,19 @@ public:
             clSetKernelArg(feedForwardSoftmaxSumKernel, 4, sizeof(int), &outputLayer.NumNeurons);
             clSetKernelArg(feedForwardSoftmaxSumKernel, 5, sizeof(int), &outputLayer.NumInputs);
             clSetKernelArg(feedForwardSoftmaxSumKernel, 6, sizeof(int), &lastHidden.NumNeurons);
-            
+
             err = clEnqueueNDRangeKernel(queue, feedForwardSoftmaxSumKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
             CL_CHECK(err);
             clFinish(queue);
 
-            double* h_sums = new double[outputLayer.NumNeurons];
-            clEnqueueReadBuffer(queue, d_SoftmaxSums, CL_TRUE, 0, outputLayer.NumNeurons * sizeof(double), h_sums, 0, NULL, NULL);
+            float* h_sums = new float[outputLayer.NumNeurons];
+            clEnqueueReadBuffer(queue, d_SoftmaxSums, CL_TRUE, 0, outputLayer.NumNeurons * sizeof(float), h_sums, 0, NULL, NULL);
 
-            double maxVal = h_sums[0];
+            float maxVal = h_sums[0];
             for (int i = 1; i < outputLayer.NumNeurons; i++)
                 if (h_sums[i] > maxVal) maxVal = h_sums[i];
 
-            double sumExp = 0;
+            float sumExp = 0;
             for (int i = 0; i < outputLayer.NumNeurons; i++)
                 sumExp += exp(h_sums[i] - maxVal);
 
@@ -627,9 +627,9 @@ public:
             clSetKernelArg(softmaxKernel, 0, sizeof(cl_mem), &d_SoftmaxSums);
             clSetKernelArg(softmaxKernel, 1, sizeof(cl_mem), &outputLayer.Outputs);
             clSetKernelArg(softmaxKernel, 2, sizeof(int), &outputLayer.NumNeurons);
-            clSetKernelArg(softmaxKernel, 3, sizeof(double), &maxVal);
-            clSetKernelArg(softmaxKernel, 4, sizeof(double), &sumExp);
-            
+            clSetKernelArg(softmaxKernel, 3, sizeof(float), &maxVal);
+            clSetKernelArg(softmaxKernel, 4, sizeof(float), &sumExp);
+
             err = clEnqueueNDRangeKernel(queue, softmaxKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
             CL_CHECK(err);
         } else {
@@ -642,7 +642,7 @@ public:
             clSetKernelArg(feedForwardKernel, 6, sizeof(int), &lastHidden.NumNeurons);
             int actType = (int)outputLayer.ActivationType;
             clSetKernelArg(feedForwardKernel, 7, sizeof(int), &actType);
-            
+
             err = clEnqueueNDRangeKernel(queue, feedForwardKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
             CL_CHECK(err);
         }
@@ -653,17 +653,17 @@ public:
         cl_int err;
         LayerData& outputLayer = Layers[NumLayers - 1];
         size_t globalSize = ((outputLayer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-        
+
         int isSoftmax = (OutputActivation == atSoftmax) ? 1 : 0;
         int actType = (int)outputLayer.ActivationType;
-        
+
         clSetKernelArg(backPropOutputKernel, 0, sizeof(cl_mem), &outputLayer.Errors);
         clSetKernelArg(backPropOutputKernel, 1, sizeof(cl_mem), &outputLayer.Outputs);
         clSetKernelArg(backPropOutputKernel, 2, sizeof(cl_mem), &d_Target);
         clSetKernelArg(backPropOutputKernel, 3, sizeof(int), &outputLayer.NumNeurons);
         clSetKernelArg(backPropOutputKernel, 4, sizeof(int), &actType);
         clSetKernelArg(backPropOutputKernel, 5, sizeof(int), &isSoftmax);
-        
+
         err = clEnqueueNDRangeKernel(queue, backPropOutputKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
         CL_CHECK(err);
         clFinish(queue);
@@ -672,9 +672,9 @@ public:
             LayerData& layer = Layers[k];
             LayerData& nextLayer = Layers[k + 1];
             globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            
+
             actType = (int)layer.ActivationType;
-            
+
             clSetKernelArg(backPropHiddenKernel, 0, sizeof(cl_mem), &layer.Errors);
             clSetKernelArg(backPropHiddenKernel, 1, sizeof(cl_mem), &layer.Outputs);
             clSetKernelArg(backPropHiddenKernel, 2, sizeof(cl_mem), &layer.DropoutMask);
@@ -684,7 +684,7 @@ public:
             clSetKernelArg(backPropHiddenKernel, 6, sizeof(int), &actType);
             clSetKernelArg(backPropHiddenKernel, 7, sizeof(int), &nextLayer.NumNeurons);
             clSetKernelArg(backPropHiddenKernel, 8, sizeof(int), &nextLayer.NumInputs);
-            
+
             err = clEnqueueNDRangeKernel(queue, backPropHiddenKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
             CL_CHECK(err);
             clFinish(queue);
@@ -708,12 +708,12 @@ public:
                     clSetKernelArg(updateWeightsSGDKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
                     clSetKernelArg(updateWeightsSGDKernel, 4, sizeof(int), &layer.NumNeurons);
                     clSetKernelArg(updateWeightsSGDKernel, 5, sizeof(int), &layer.NumInputs);
-                    clSetKernelArg(updateWeightsSGDKernel, 6, sizeof(double), &LearningRate);
-                    clSetKernelArg(updateWeightsSGDKernel, 7, sizeof(double), &L2Lambda);
+                    clSetKernelArg(updateWeightsSGDKernel, 6, sizeof(float), &LearningRate);
+                    clSetKernelArg(updateWeightsSGDKernel, 7, sizeof(float), &L2Lambda);
                     err = clEnqueueNDRangeKernel(queue, updateWeightsSGDKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
                     CL_CHECK(err);
                     break;
-                    
+
                 case otAdam:
                     clSetKernelArg(updateWeightsAdamKernel, 0, sizeof(cl_mem), &layer.Weights);
                     clSetKernelArg(updateWeightsAdamKernel, 1, sizeof(cl_mem), &layer.Biases);
@@ -725,15 +725,15 @@ public:
                     clSetKernelArg(updateWeightsAdamKernel, 7, sizeof(cl_mem), &layer.VBias);
                     clSetKernelArg(updateWeightsAdamKernel, 8, sizeof(int), &layer.NumNeurons);
                     clSetKernelArg(updateWeightsAdamKernel, 9, sizeof(int), &layer.NumInputs);
-                    clSetKernelArg(updateWeightsAdamKernel, 10, sizeof(double), &LearningRate);
-                    clSetKernelArg(updateWeightsAdamKernel, 11, sizeof(double), &L2Lambda);
-                    clSetKernelArg(updateWeightsAdamKernel, 12, sizeof(double), &Beta1);
-                    clSetKernelArg(updateWeightsAdamKernel, 13, sizeof(double), &Beta2);
+                    clSetKernelArg(updateWeightsAdamKernel, 10, sizeof(float), &LearningRate);
+                    clSetKernelArg(updateWeightsAdamKernel, 11, sizeof(float), &L2Lambda);
+                    clSetKernelArg(updateWeightsAdamKernel, 12, sizeof(float), &Beta1);
+                    clSetKernelArg(updateWeightsAdamKernel, 13, sizeof(float), &Beta2);
                     clSetKernelArg(updateWeightsAdamKernel, 14, sizeof(int), &Timestep);
                     err = clEnqueueNDRangeKernel(queue, updateWeightsAdamKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
                     CL_CHECK(err);
                     break;
-                    
+
                 case otRMSProp:
                     clSetKernelArg(updateWeightsRMSPropKernel, 0, sizeof(cl_mem), &layer.Weights);
                     clSetKernelArg(updateWeightsRMSPropKernel, 1, sizeof(cl_mem), &layer.Biases);
@@ -743,8 +743,8 @@ public:
                     clSetKernelArg(updateWeightsRMSPropKernel, 5, sizeof(cl_mem), &layer.VBias);
                     clSetKernelArg(updateWeightsRMSPropKernel, 6, sizeof(int), &layer.NumNeurons);
                     clSetKernelArg(updateWeightsRMSPropKernel, 7, sizeof(int), &layer.NumInputs);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 8, sizeof(double), &LearningRate);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 9, sizeof(double), &L2Lambda);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 8, sizeof(float), &LearningRate);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 9, sizeof(float), &L2Lambda);
                     err = clEnqueueNDRangeKernel(queue, updateWeightsRMSPropKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
                     CL_CHECK(err);
                     break;
@@ -753,44 +753,44 @@ public:
         clFinish(queue);
     }
 
-    void Predict(const double* Input, double* Result) {
+    void Predict(const float* Input, float* Result) {
         FIsTraining = false;
 
-        double* h_input = new double[FInputSize + 1];
+        float* h_input = new float[FInputSize + 1];
         for (int i = 0; i < FInputSize; i++) h_input[i] = Input[i];
         h_input[FInputSize] = 1.0;
-        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(double), h_input, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
         delete[] h_input;
 
         FeedForward();
 
-        clEnqueueReadBuffer(queue, Layers[NumLayers - 1].Outputs, CL_TRUE, 0, FOutputSize * sizeof(double), Result, 0, NULL, NULL);
+        clEnqueueReadBuffer(queue, Layers[NumLayers - 1].Outputs, CL_TRUE, 0, FOutputSize * sizeof(float), Result, 0, NULL, NULL);
 
         FIsTraining = true;
     }
 
-    void Train(const double* Input, const double* Target) {
+    void Train(const float* Input, const float* Target) {
         FIsTraining = true;
 
-        double* h_input = new double[FInputSize + 1];
+        float* h_input = new float[FInputSize + 1];
         for (int i = 0; i < FInputSize; i++) h_input[i] = Input[i];
         h_input[FInputSize] = 1.0;
-        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(double), h_input, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
         delete[] h_input;
 
-        clEnqueueWriteBuffer(queue, d_Target, CL_TRUE, 0, FOutputSize * sizeof(double), Target, 0, NULL, NULL);
+        clEnqueueWriteBuffer(queue, d_Target, CL_TRUE, 0, FOutputSize * sizeof(float), Target, 0, NULL, NULL);
 
         FeedForward();
         BackPropagate();
         UpdateWeights();
     }
 
-    double ComputeLoss(const double* Predicted, const double* Target) {
-        double Result = 0;
+    float ComputeLoss(const float* Predicted, const float* Target) {
+        float Result = 0;
 
         if (OutputActivation == atSoftmax) {
             for (int i = 0; i < FOutputSize; i++) {
-                double p = Predicted[i];
+                float p = Predicted[i];
                 if (p < EPSILON) p = EPSILON;
                 if (p > 1 - EPSILON) p = 1 - EPSILON;
                 Result -= Target[i] * log(p);
@@ -825,20 +825,20 @@ public:
         fwrite(&numHidden, sizeof(int), 1, f);
         fwrite(FHiddenSizes.data(), sizeof(int), numHidden, f);
 
-        fwrite(&LearningRate, sizeof(double), 1, f);
+        fwrite(&LearningRate, sizeof(float), 1, f);
         int opt = (int)Optimizer;
         fwrite(&opt, sizeof(int), 1, f);
         int hidAct = (int)HiddenActivation;
         fwrite(&hidAct, sizeof(int), 1, f);
         int outAct = (int)OutputActivation;
         fwrite(&outAct, sizeof(int), 1, f);
-        fwrite(&DropoutRate, sizeof(double), 1, f);
-        fwrite(&L2Lambda, sizeof(double), 1, f);
-        fwrite(&Beta1, sizeof(double), 1, f);
-        fwrite(&Beta2, sizeof(double), 1, f);
+        fwrite(&DropoutRate, sizeof(float), 1, f);
+        fwrite(&L2Lambda, sizeof(float), 1, f);
+        fwrite(&Beta1, sizeof(float), 1, f);
+        fwrite(&Beta2, sizeof(float), 1, f);
         fwrite(&Timestep, sizeof(int), 1, f);
         fwrite(&EnableLRDecay, sizeof(bool), 1, f);
-        fwrite(&LRDecayRate, sizeof(double), 1, f);
+        fwrite(&LRDecayRate, sizeof(float), 1, f);
         fwrite(&LRDecayEpochs, sizeof(int), 1, f);
         fwrite(&EnableEarlyStopping, sizeof(bool), 1, f);
         fwrite(&EarlyStoppingPatience, sizeof(int), 1, f);
@@ -847,26 +847,26 @@ public:
             LayerData& layer = Layers[k];
             int weightSize = layer.NumNeurons * layer.NumInputs;
 
-            double* h_weights = new double[weightSize];
-            double* h_biases = new double[layer.NumNeurons];
-            double* h_M = new double[weightSize];
-            double* h_V = new double[weightSize];
-            double* h_MBias = new double[layer.NumNeurons];
-            double* h_VBias = new double[layer.NumNeurons];
+            float* h_weights = new float[weightSize];
+            float* h_biases = new float[layer.NumNeurons];
+            float* h_M = new float[weightSize];
+            float* h_V = new float[weightSize];
+            float* h_MBias = new float[layer.NumNeurons];
+            float* h_VBias = new float[layer.NumNeurons];
 
-            clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(double), h_weights, 0, NULL, NULL);
-            clEnqueueReadBuffer(queue, layer.Biases, CL_TRUE, 0, layer.NumNeurons * sizeof(double), h_biases, 0, NULL, NULL);
-            clEnqueueReadBuffer(queue, layer.M, CL_TRUE, 0, weightSize * sizeof(double), h_M, 0, NULL, NULL);
-            clEnqueueReadBuffer(queue, layer.V, CL_TRUE, 0, weightSize * sizeof(double), h_V, 0, NULL, NULL);
-            clEnqueueReadBuffer(queue, layer.MBias, CL_TRUE, 0, layer.NumNeurons * sizeof(double), h_MBias, 0, NULL, NULL);
-            clEnqueueReadBuffer(queue, layer.VBias, CL_TRUE, 0, layer.NumNeurons * sizeof(double), h_VBias, 0, NULL, NULL);
+            clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(float), h_weights, 0, NULL, NULL);
+            clEnqueueReadBuffer(queue, layer.Biases, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_biases, 0, NULL, NULL);
+            clEnqueueReadBuffer(queue, layer.M, CL_TRUE, 0, weightSize * sizeof(float), h_M, 0, NULL, NULL);
+            clEnqueueReadBuffer(queue, layer.V, CL_TRUE, 0, weightSize * sizeof(float), h_V, 0, NULL, NULL);
+            clEnqueueReadBuffer(queue, layer.MBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_MBias, 0, NULL, NULL);
+            clEnqueueReadBuffer(queue, layer.VBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_VBias, 0, NULL, NULL);
 
-            fwrite(h_weights, sizeof(double), weightSize, f);
-            fwrite(h_biases, sizeof(double), layer.NumNeurons, f);
-            fwrite(h_M, sizeof(double), weightSize, f);
-            fwrite(h_V, sizeof(double), weightSize, f);
-            fwrite(h_MBias, sizeof(double), layer.NumNeurons, f);
-            fwrite(h_VBias, sizeof(double), layer.NumNeurons, f);
+            fwrite(h_weights, sizeof(float), weightSize, f);
+            fwrite(h_biases, sizeof(float), layer.NumNeurons, f);
+            fwrite(h_M, sizeof(float), weightSize, f);
+            fwrite(h_V, sizeof(float), weightSize, f);
+            fwrite(h_MBias, sizeof(float), layer.NumNeurons, f);
+            fwrite(h_VBias, sizeof(float), layer.NumNeurons, f);
 
             delete[] h_weights;
             delete[] h_biases;
@@ -899,27 +899,27 @@ public:
         std::vector<int> hiddenSizes(numHidden);
         fread(hiddenSizes.data(), sizeof(int), numHidden, f);
 
-        double learningRate;
+        float learningRate;
         int opt, hidAct, outAct;
-        fread(&learningRate, sizeof(double), 1, f);
+        fread(&learningRate, sizeof(float), 1, f);
         fread(&opt, sizeof(int), 1, f);
         fread(&hidAct, sizeof(int), 1, f);
         fread(&outAct, sizeof(int), 1, f);
 
         TMultiLayerPerceptronOpenCL* mlp = new TMultiLayerPerceptronOpenCL(
-            inputSize, hiddenSizes, outputSize, 
+            inputSize, hiddenSizes, outputSize,
             (TActivationType)hidAct, (TActivationType)outAct);
 
         mlp->LearningRate = learningRate;
         mlp->Optimizer = (TOptimizerType)opt;
 
-        fread(&mlp->DropoutRate, sizeof(double), 1, f);
-        fread(&mlp->L2Lambda, sizeof(double), 1, f);
-        fread(&mlp->Beta1, sizeof(double), 1, f);
-        fread(&mlp->Beta2, sizeof(double), 1, f);
+        fread(&mlp->DropoutRate, sizeof(float), 1, f);
+        fread(&mlp->L2Lambda, sizeof(float), 1, f);
+        fread(&mlp->Beta1, sizeof(float), 1, f);
+        fread(&mlp->Beta2, sizeof(float), 1, f);
         fread(&mlp->Timestep, sizeof(int), 1, f);
         fread(&mlp->EnableLRDecay, sizeof(bool), 1, f);
-        fread(&mlp->LRDecayRate, sizeof(double), 1, f);
+        fread(&mlp->LRDecayRate, sizeof(float), 1, f);
         fread(&mlp->LRDecayEpochs, sizeof(int), 1, f);
         fread(&mlp->EnableEarlyStopping, sizeof(bool), 1, f);
         fread(&mlp->EarlyStoppingPatience, sizeof(int), 1, f);
@@ -928,26 +928,26 @@ public:
             LayerData& layer = mlp->Layers[k];
             int weightSize = layer.NumNeurons * layer.NumInputs;
 
-            double* h_weights = new double[weightSize];
-            double* h_biases = new double[layer.NumNeurons];
-            double* h_M = new double[weightSize];
-            double* h_V = new double[weightSize];
-            double* h_MBias = new double[layer.NumNeurons];
-            double* h_VBias = new double[layer.NumNeurons];
+            float* h_weights = new float[weightSize];
+            float* h_biases = new float[layer.NumNeurons];
+            float* h_M = new float[weightSize];
+            float* h_V = new float[weightSize];
+            float* h_MBias = new float[layer.NumNeurons];
+            float* h_VBias = new float[layer.NumNeurons];
 
-            fread(h_weights, sizeof(double), weightSize, f);
-            fread(h_biases, sizeof(double), layer.NumNeurons, f);
-            fread(h_M, sizeof(double), weightSize, f);
-            fread(h_V, sizeof(double), weightSize, f);
-            fread(h_MBias, sizeof(double), layer.NumNeurons, f);
-            fread(h_VBias, sizeof(double), layer.NumNeurons, f);
+            fread(h_weights, sizeof(float), weightSize, f);
+            fread(h_biases, sizeof(float), layer.NumNeurons, f);
+            fread(h_M, sizeof(float), weightSize, f);
+            fread(h_V, sizeof(float), weightSize, f);
+            fread(h_MBias, sizeof(float), layer.NumNeurons, f);
+            fread(h_VBias, sizeof(float), layer.NumNeurons, f);
 
-            clEnqueueWriteBuffer(mlp->queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(double), h_weights, 0, NULL, NULL);
-            clEnqueueWriteBuffer(mlp->queue, layer.Biases, CL_TRUE, 0, layer.NumNeurons * sizeof(double), h_biases, 0, NULL, NULL);
-            clEnqueueWriteBuffer(mlp->queue, layer.M, CL_TRUE, 0, weightSize * sizeof(double), h_M, 0, NULL, NULL);
-            clEnqueueWriteBuffer(mlp->queue, layer.V, CL_TRUE, 0, weightSize * sizeof(double), h_V, 0, NULL, NULL);
-            clEnqueueWriteBuffer(mlp->queue, layer.MBias, CL_TRUE, 0, layer.NumNeurons * sizeof(double), h_MBias, 0, NULL, NULL);
-            clEnqueueWriteBuffer(mlp->queue, layer.VBias, CL_TRUE, 0, layer.NumNeurons * sizeof(double), h_VBias, 0, NULL, NULL);
+            clEnqueueWriteBuffer(mlp->queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(float), h_weights, 0, NULL, NULL);
+            clEnqueueWriteBuffer(mlp->queue, layer.Biases, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_biases, 0, NULL, NULL);
+            clEnqueueWriteBuffer(mlp->queue, layer.M, CL_TRUE, 0, weightSize * sizeof(float), h_M, 0, NULL, NULL);
+            clEnqueueWriteBuffer(mlp->queue, layer.V, CL_TRUE, 0, weightSize * sizeof(float), h_V, 0, NULL, NULL);
+            clEnqueueWriteBuffer(mlp->queue, layer.MBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_MBias, 0, NULL, NULL);
+            clEnqueueWriteBuffer(mlp->queue, layer.VBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_VBias, 0, NULL, NULL);
 
             delete[] h_weights;
             delete[] h_biases;
@@ -963,11 +963,11 @@ public:
 };
 
 // Utility functions and main() remain the same as CUDA version, just using OpenCL class
-double RandomDouble() {
-    return (double)rand() / RAND_MAX;
+float RandomDouble() {
+    return (float)rand() / RAND_MAX;
 }
 
-int MaxIndex(const double* arr, int n) {
+int MaxIndex(const float* arr, int n) {
     int result = 0;
     for (int i = 1; i < n; i++)
         if (arr[i] > arr[result])
@@ -976,8 +976,8 @@ int MaxIndex(const double* arr, int n) {
 }
 
 struct DataPoint {
-    std::vector<double> Input;
-    std::vector<double> Target;
+    std::vector<float> Input;
+    std::vector<float> Target;
 };
 
 const char* ActivationToStr(TActivationType act) {
@@ -1022,8 +1022,8 @@ std::vector<int> ParseIntArray(const char* s) {
     return result;
 }
 
-std::vector<double> ParseDoubleArray(const char* s) {
-    std::vector<double> result;
+std::vector<float> ParseDoubleArray(const char* s) {
+    std::vector<float> result;
     std::stringstream ss(s);
     std::string token;
     while (std::getline(ss, token, ',')) {
@@ -1040,7 +1040,7 @@ std::vector<DataPoint> LoadDataCSV(const char* filename, int inputSize, int outp
     std::string line;
     while (std::getline(file, line)) {
         if (line.empty()) continue;
-        std::vector<double> values = ParseDoubleArray(line.c_str());
+        std::vector<float> values = ParseDoubleArray(line.c_str());
         if ((int)values.size() < inputSize + outputSize) continue;
 
         DataPoint dp;
@@ -1064,7 +1064,7 @@ void NormalizeData(std::vector<DataPoint>& data) {
     if (data.empty()) return;
     int inputSize = data[0].Input.size();
 
-    std::vector<double> mins(inputSize), maxs(inputSize);
+    std::vector<float> mins(inputSize), maxs(inputSize);
     for (int j = 0; j < inputSize; j++) {
         mins[j] = maxs[j] = data[0].Input[j];
     }
@@ -1076,7 +1076,7 @@ void NormalizeData(std::vector<DataPoint>& data) {
     }
     for (auto& dp : data) {
         for (int j = 0; j < inputSize; j++) {
-            double range = maxs[j] - mins[j];
+            float range = maxs[j] - mins[j];
             dp.Input[j] = (range > 0) ? (dp.Input[j] - mins[j]) / range : 0.5;
         }
     }
@@ -1163,15 +1163,15 @@ int main(int argc, char** argv) {
 
     int inputSize = 0, outputSize = 0;
     std::vector<int> hiddenSizes;
-    std::vector<double> inputValues;
+    std::vector<float> inputValues;
     std::string modelFile, saveFile, dataFile;
-    double learningRate = 0.1;
+    float learningRate = 0.1;
     TOptimizerType optimizer = otSGD;
     TActivationType hiddenAct = atSigmoid, outputAct = atSigmoid;
-    double dropoutRate = 0, l2Lambda = 0, beta1 = 0.9, beta2 = 0.999;
+    float dropoutRate = 0, l2Lambda = 0, beta1 = 0.9, beta2 = 0.999;
     int epochs = 100, batchSize = 1;
     bool lrDecay = false, earlyStop = false, normalize = false, verbose = false;
-    double lrDecayRate = 0.95;
+    float lrDecayRate = 0.95;
     int lrDecayEpochs = 10, patience = 10;
     bool lrOverride = false;
 
@@ -1222,19 +1222,19 @@ int main(int argc, char** argv) {
     cl_platform_id platform;
     cl_device_id device;
     char deviceName[128];
-    
+
     if (clGetPlatformIDs(1, &platform, NULL) != CL_SUCCESS) {
         printf("Error: No OpenCL platforms found!\n");
         return 1;
     }
-    
+
     if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL) != CL_SUCCESS) {
         if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL) != CL_SUCCESS) {
             printf("Error: No OpenCL devices found!\n");
             return 1;
         }
     }
-    
+
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(deviceName), deviceName, NULL);
 
     if (command == cmdCreate) {
@@ -1297,7 +1297,7 @@ int main(int argc, char** argv) {
             printf("Data normalized\n");
         }
 
-        double* output = new double[mlp->GetOutputSize()];
+        float* output = new float[mlp->GetOutputSize()];
 
         for (int epoch = 1; epoch <= epochs; epoch++) {
             ShuffleData(data);
@@ -1306,7 +1306,7 @@ int main(int argc, char** argv) {
                 mlp->Train(dp.Input.data(), dp.Target.data());
 
             if (verbose && (epoch % 10 == 0 || epoch == 1)) {
-                double totalLoss = 0;
+                float totalLoss = 0;
                 for (auto& dp : data) {
                     mlp->Predict(dp.Input.data(), output);
                     totalLoss += mlp->ComputeLoss(output, dp.Target.data());
@@ -1315,7 +1315,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        double totalLoss = 0;
+        float totalLoss = 0;
         for (auto& dp : data) {
             mlp->Predict(dp.Input.data(), output);
             totalLoss += mlp->ComputeLoss(output, dp.Target.data());
@@ -1342,7 +1342,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        double* output = new double[mlp->GetOutputSize()];
+        float* output = new float[mlp->GetOutputSize()];
         mlp->Predict(inputValues.data(), output);
 
         printf("Input: ");
