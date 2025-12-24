@@ -1,6 +1,6 @@
 # GlassBoxAI-MLP
 
-**CUDA and OpenCL Accelerated, Fully Glassbox, Multi-Layer Perceptron Neural Network Toolkit**  
+**CUDA and OpenCL Accelerated Multi-Layer Perceptron Neural Network**  
 _By [Matthew Abbott](https://github.com/matthewJamesAbbott)_  
 MIT Licensed | GPU Powered | CLI & Facade | Open and Hackable
 
