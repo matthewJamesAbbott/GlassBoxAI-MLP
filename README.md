@@ -186,14 +186,6 @@ Example for low-dimensional XOR fitting:
 
 ---
 
-## Contributing & Sponsoring
-
-- Fork, file issues, send PRs!
-- [Sponsor @matthewJamesAbbott](https://github.com/sponsors/matthewJamesAbbott)
-- Adding new facades, protocols, optimizers, and layers always welcome!
-
----
-
 ## License
 
 MIT License  
