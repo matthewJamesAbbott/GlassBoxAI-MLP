@@ -8,44 +8,68 @@ MIT Licensed | GPU Powered | CLI & Facade | Open and Hackable
 
 ## What is GlassBoxAI-MLP?
 
-**A high-performance, fully-transparent, and extendable neural network toolkit in C++ & CUDA or OpenCL, designed for:**
-- **Speed** (GPU-accelerated learning and inference)
+A high-performance, fully-transparent, and extendable neural network toolkit in C++, CUDA, and OpenCL, designed for:
+
+- **Speed** (GPU-accelerated learning and inference on CUDA or OpenCL devices)
 - **Transparency** (inspect, modify, and audit *everything*)
-- **Hackability** (facade pattern, CLI scripting, direct weight/optimizer access)
+- **Hackability** (facade pattern, CLI scripting, direct model/optimizer access)
 - **Open Source** (MIT License—yours to use, build on, and monetize!)
 
-Built for audio, tabular data, education, science, and any hackable ML dream.
+Built for audio, tabular data, education, science, and hackable ML dreams.
 
 ---
 
 ## Build Requirements
 
-- **NVIDIA GPU** with CUDA support (CUDA 11+ recommended)
-- **CUDA Toolkit** (`nvcc` in path)
 - **C++ Compiler** (`g++`/`clang++`)
-- Linux, Windows (WSL), or Mac (NVIDIA only)
+- **CUDA Toolkit** (`nvcc` in path, CUDA 11+ recommended) — for CUDA versions
+- **OpenCL SDK/headers & driver** — for OpenCL versions
+- Linux, Windows (WSL), or Mac (NVIDIA for CUDA; any OpenCL for OpenCL)
 
-### Compile core:
-```bash
-nvcc -o mlp_cuda mlp.cu -lcurand
-```
-### Compile facade:
-```bash
-nvcc -o mlpcuda facaded_mlp.cu -lcurand
-```
+---
+
+## Building GlassBoxAI-MLP
+
+### CUDA Versions
+
+- **Core MLP (CUDA):**
+  ```bash
+  nvcc -o mlp_cuda mlp.cu -lcurand
+  ```
+- **Facade/CLI (CUDA):**
+  ```bash
+  nvcc -o facaded_mlp_cuda facaded_mlp.cu -lcurand
+  ```
+
+### OpenCL Versions
+
+- **Core MLP (OpenCL):**
+  ```bash
+  g++ -std=c++14 -o mlp_opencl mlp_opencl.cpp -lOpenCL
+  ```
+- **Facade/CLI (OpenCL):**
+  ```bash
+  g++ -std=c++14 -o facaded_mlp_opencl facaded_mlp_opencl.cpp -lOpenCL
+  ```
+
+Adjust compiler flags as needed for your platform.
 
 ---
 
 ## File Structure
 
-- **mlp.cu**&nbsp;&nbsp;&mdash; Core CUDA MLP (minimal CLI)
-- **facaded_mlp.cu**&nbsp;&nbsp;&mdash; CLI + Facade version (full internal inspection/modification)
-- **LICENSE**&nbsp;&nbsp;&mdash; MIT License
-- **README.md**&nbsp;&nbsp;&mdash; This file
+- **mlp.cu:** Core CUDA MLP (minimal CLI)
+- **facaded_mlp.cu:** CUDA facade/CLI, advanced operations
+- **mlp_opencl.cpp:** Core OpenCL MLP (minimal CLI)
+- **facaded_mlp_opencl.cpp:** OpenCL facade/CLI, advanced operations
+- **license.md**: MIT License
+- **README.md**: This file
 
 ---
 
 ## CLI Usage Overview
+
+All binaries (CUDA and OpenCL) support similar CLI commands. CLI names may differ (`mlp_cuda`/`mlp_opencl`, `facaded_mlp_cuda`/`facaded_mlp_opencl`). Substitute the filename as appropriate.
 
 ### Common Commands
 
@@ -57,15 +81,25 @@ info        # Display model metadata and hyperparameters
 help        # Show usage and arguments
 ```
 
-#### Example:
+#### Example (CUDA):
 ```sh
-mlpcuda create --input=2 --hidden=8 --output=1 --optimizer=adam --save=model.bin
-mlpcuda train --model=model.bin --data=xor_cuda.csv --epochs=1000 --save=model.bin
-mlpcuda predict --model=model.bin --input=1,0
-mlpcuda info --model=model.bin
+./facaded_mlp_cuda create --input=2 --hidden=8 --output=1 --optimizer=adam --save=model.bin
+./facaded_mlp_cuda train --model=model.bin --data=xor_cuda.csv --epochs=1000 --save=model.bin
+./facaded_mlp_cuda predict --model=model.bin --input=1,0
+./facaded_mlp_cuda info --model=model.bin
+```
+
+#### Example (OpenCL):
+```sh
+./facaded_mlp_opencl create --input=2 --hidden=8 --output=1 --optimizer=adam --save=modelcl.bin
+./facaded_mlp_opencl train --model=modelcl.bin --data=xor_opencl.csv --epochs=1000 --save=modelcl.bin
+./facaded_mlp_opencl predict --model=modelcl.bin --input=1,0
+./facaded_mlp_opencl info --model=modelcl.bin
 ```
 
 ### Advanced ("Facade") Commands
+
+Available in `facaded_mlp_cuda` and `facaded_mlp_opencl`:
 
 ```sh
 get-weight    # Query a specific weight value
@@ -76,135 +110,64 @@ get-output    # Get neuron outputs after prediction
 get-error     # Get neuron errors after training
 layer-info    # Show full layer breakdown
 histogram     # Activation/gradient histogram for a layer
-get-optimizer # Display optimizer (Adam/RMSProp) state, M/V stats
+get-optimizer # Display optimizer state, M/V stats
 ```
 
 ---
 
-## Quick Example: XOR with Minimal MLP (`mlp.cu`)
+## Quick Example: XOR with Minimal MLP (CUDA & OpenCL)
 
-### Create & Train
+### CUDA Example
 
 ```sh
 ./mlp_cuda create --input=2 --hidden=8 --output=1 --optimizer=adam --lr=0.1 --save=xor.bin
 ./mlp_cuda train --model=xor.bin --data=xor_cuda.csv --epochs=2000 --verbose --save=xor_trained.bin
-```
-
-_Output Snippet:_
-```
-Created CUDA MLP model (GPU: NVIDIA GeForce RTX 3070 Laptop GPU):
-  Input size: 2
-  Hidden sizes: 8
-  Output size: 1
-  Hidden activation: sigmoid
-  Output activation: sigmoid
-  Optimizer: adam
-  Learning rate: 0.1000
-
-Epoch 2000/2000 - Loss: 0.000002
-Final loss: 0.000002
-Model saved to: xor_trained.bin
-```
-
-### Predict & Inspect
-```sh
 ./mlp_cuda predict --model=xor_trained.bin --input=0,1
-# Output: 0.998876
+```
 
-./mlp_cuda info --model=xor_trained.bin
+### OpenCL Example
+
+```sh
+./mlp_opencl create --input=2 --hidden=8 --output=1 --optimizer=adam --lr=0.1 --save=xorcl.bin
+./mlp_opencl train --model=xorcl.bin --data=xor_opencl.csv --epochs=2000 --verbose --save=xorcl_trained.bin
+./mlp_opencl predict --model=xorcl_trained.bin --input=0,1
 ```
-_Sample Output:_
-```
-MLP Model Information (CUDA)
-============================
-GPU: NVIDIA GeForce RTX 3070 Laptop GPU
-Input size: 2
-Output size: 1
-Hidden layers: 1
-Layer sizes: 2 -> 8 -> 1
-Hyperparameters: [full dump...]
-```
+
+Outputs and options are similar between versions.
 
 ---
 
-## Facade Demo: Inspect & Hack Internals (`facaded_mlp.cu`, `mlpcuda`)
+## Facade Demo: Inspect & Modify Internals
 
-### Create & Train
+The facade binaries (`facaded_mlp_cuda`, `facaded_mlp_opencl`) expose advanced CLI actions for model research and hacking—on CUDA or OpenCL as you prefer.
+
+#### Advanced Example (CUDA)
 ```sh
-./mlpcuda create --input=2 --hidden=8 --output=1 --optimizer=adam --save=test.bin
-./mlpcuda train --model=test.bin --data=xor_cuda.csv --epochs=1000 --save=test.bin
-```
-_Output:_
-```
-Created CUDA MLP model (GPU: NVIDIA GeForce RTX 3070 Laptop GPU):
-  Input size: 2
-  Hidden sizes: 8
-  Output size: 1
-  Hidden activation: sigmoid
-  Output activation: sigmoid
-  Optimizer: adam
-  Learning rate: 0.1000
-  Saved to: test.bin
-
-Final loss: 0.000007
-Model saved to: test.bin
+./facaded_mlp_cuda get-weight --model=model.bin --layer=1 --neuron=0 --weight=0
+./facaded_mlp_cuda set-weight --model=model.bin --layer=1 --neuron=0 --weight=0 --value=0.5 --save=model.bin
+./facaded_mlp_cuda histogram --model=model.bin --layer=1 --type=activation --run-input=1,0
 ```
 
-### Advanced Facade Actions
+#### Advanced Example (OpenCL)
 ```sh
-./mlpcuda get-weight --model=test.bin --layer=1 --neuron=0 --weight=0
-# Weight[layer=1, neuron=0, weight=0] = -8.6098613769
-
-./mlpcuda get-weights --model=test.bin --layer=1 --neuron=0
-# [0] = -8.6098613769
-# [1] = 5.8026426096
-# [2] = -1.6070945553
-
-./mlpcuda get-bias --model=test.bin --layer=1 --neuron=0
-# Bias[layer=1, neuron=0] = -0.9544519568
-
-./mlpcuda get-output --model=test.bin --layer=1 --run-input=1,0
-# Outputs[layer=1] (9 neurons): [0] = 0.0000140706 ... [8] = 0.9900115786
-
-./mlpcuda histogram --model=test.bin --layer=1 --type=activation --run-input=1,0
-# Activation Histogram [layer=1] (20 bins): [ 0] 4 |######################################## ...
-
-./mlpcuda set-weight --model=test.bin --layer=1 --neuron=0 --weight=0 --value=0.5 --save=test.bin
-# Weight[layer=1, neuron=0, weight=0]: -8.6098613769 -> 0.5000000000
-# Saved to: test.bin
+./facaded_mlp_opencl get-weight --model=modelcl.bin --layer=1 --neuron=0 --weight=0
+./facaded_mlp_opencl set-weight --model=modelcl.bin --layer=1 --neuron=0 --weight=0 --value=0.5 --save=modelcl.bin
+./facaded_mlp_opencl histogram --model=modelcl.bin --layer=1 --type=activation --run-input=1,0
 ```
 
 ---
 
 ## Help Screens
 
-### Core CLI Help
-```
-MLPCuda - CUDA Command-line Multi-Layer Perceptron
-
-Commands: create, train, predict, info, help
-Options: --input, --hidden, --output, --save, --lr, --optimizer, --hidden-act, --output-act, --dropout, --l2, --beta1, --beta2, etc.
-Examples:
-  mlpcuda create --input=2 --hidden=4,4 --output=1 --save=xor.bin
-```
-
-### Facade Help
-```
-Facade Commands:
-  get-weight, set-weight, get-bias, set-bias, get-output, get-error, layer-info, histogram, get-optimizer
-Facade Options:
-  --layer=N, --neuron=N, --weight=N, --value=V, --type=TYPE, --bins=N, --run-input, --save
-Facade Examples:
-  mlpcuda get-weight --model=m.bin --layer=1 --neuron=0 --weight=2
-  mlpcuda histogram --model=m.bin --layer=1 --type=activation --run-input=1,0
-```
+Both CUDA and OpenCL CLIs support `help` commands with full argument info.
 
 ---
 
 ## Why GlassBoxAI-MLP?
 
-- **Perfect reproducible XOR and classic ML fits (see above)**
-- **Built for hacking:** adjust weights, biases, optimizer states, activations, and more at runtime—no black-box barriers!
+- **Supports multiple backends:** CUDA or OpenCL for maximum compatibility
+- **Perfect reproducible XOR and classic ML fits**
+- **Full hackability:** adjust weights, biases, activations at runtime
 - **Full CLI for scripting, automation, and reproducibility**
 - **MIT license—use in research, commercial, educational, or personal projects**
 
@@ -212,7 +175,8 @@ Facade Examples:
 
 ## Example Dataset (XOR)
 
-_Create `xor_cuda.csv`:_
+Example for low-dimensional XOR fitting:
+
 ```
 0,0,0
 0,1,1
@@ -226,7 +190,7 @@ _Create `xor_cuda.csv`:_
 
 - Fork, file issues, send PRs!
 - [Sponsor @matthewJamesAbbott](https://github.com/sponsors/matthewJamesAbbott)
-- Extending interfaces, adding more facades, protocols, new optimizers and layers always welcome!
+- Adding new facades, protocols, optimizers, and layers always welcome!
 
 ---
 
@@ -234,15 +198,3 @@ _Create `xor_cuda.csv`:_
 
 MIT License  
 © 2025 Matthew Abbott
-
----
-
-**For full source code:**  
-- [facaded_mlp.cu](facaded_mlp.cu)
-- [mlp.cu](mlp.cu)
-
-**[GlassBoxAI.org](https://glassboxai.org) (coming soon for docs/community)**
-
----
-
-*GlassBoxAI-MLP: Remove the black box—see, control, hack, and scale machine learning your way!*
