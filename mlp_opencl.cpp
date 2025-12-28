@@ -1,15 +1,13 @@
 //
-// MLPOpenCL - OpenCL Command-line Multi-Layer Perceptron
-// CLI: Create, Train, Predict, Inspect models. For scripting or research use.
-// Enhanced with: Softmax, Adam/RMSProp optimizers, Dropout, L2 regularization,
-// Xavier/He initialization, LR decay, Early stopping, Data normalization.
+// MLPOpenCLFacaded - OpenCL Command-line Multi-Layer Perceptron with Full Facade
+// CLI: Create, Train, Predict, Inspect, and Directly Modify Model Internals
+// Matches and extends the CUDA/Facade interface
 //
 // Matthew Abbott 2025
 //
 // Compile:
-//   g++ -o mlp_opencl mlp_opencl.cpp -lOpenCL -std=c++11
+//   g++ -o facaded_mlp_opencl facaded_mlp_opencl.cpp -lOpenCL -std=c++11
 //
-
 
 #define CL_TARGET_OPENCL_VERSION 120
 #ifdef __APPLE__
@@ -27,7 +25,9 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
+// -------- Error checking macro --------
 #define CL_CHECK(err) \
     do { \
         if (err != CL_SUCCESS) { \
@@ -36,15 +36,21 @@
         } \
     } while(0)
 
-const float EPSILON = 1e-15;
+const double EPSILON = 1e-15;
 const int BLOCK_SIZE = 256;
 const char MODEL_MAGIC[] = "MLPOCL01";
 
+// -------- Activation and Optimizer types --------
 enum TActivationType { atSigmoid = 0, atTanh = 1, atReLU = 2, atSoftmax = 3 };
 enum TOptimizerType { otSGD = 0, otAdam = 1, otRMSProp = 2 };
-enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp };
+enum TCommand {
+    cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp,
+    cmdGetWeight, cmdSetWeight, cmdGetWeights, cmdGetBias, cmdSetBias,
+    cmdGetOutput, cmdGetError, cmdLayerInfo, cmdHistogram,
+    cmdGetOptimizer
+};
 
-// OpenCL kernel source code
+// -------- OpenCL kernel source code --------
 const char* kernelSource = R"CLC(
 
 float d_Sigmoid(float x) {
@@ -308,6 +314,7 @@ __kernel void UpdateWeightsRMSPropKernel(__global float* weights,
 
 )CLC";
 
+// -------- LayerData structure --------
 struct LayerData {
     cl_mem Weights;
     cl_mem Biases;
@@ -323,7 +330,8 @@ struct LayerData {
     TActivationType ActivationType;
 };
 
-class TMultiLayerPerceptronOpenCL {
+// -------- OpenCL Multi-Layer Perceptron with Facade --------
+class TMultiLayerPerceptronOpenCLFacaded {
 private:
     cl_context context;
     cl_command_queue queue;
@@ -407,8 +415,8 @@ private:
         layer.NumNeurons = numNeurons;
         layer.NumInputs = numInputs;
         layer.ActivationType = actType;
-
         int weightSize = numNeurons * numInputs;
+
         layer.Weights = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err);
         CL_CHECK(err);
         layer.Biases = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
@@ -464,95 +472,6 @@ private:
         if (layer.MBias) clReleaseMemObject(layer.MBias);
         if (layer.VBias) clReleaseMemObject(layer.VBias);
         if (layer.DropoutMask) clReleaseMemObject(layer.DropoutMask);
-    }
-
-public:
-    float LearningRate;
-    int MaxIterations;
-    TOptimizerType Optimizer;
-    TActivationType HiddenActivation;
-    TActivationType OutputActivation;
-    float DropoutRate;
-    float L2Lambda;
-    float Beta1;
-    float Beta2;
-    int Timestep;
-    bool EnableLRDecay;
-    float LRDecayRate;
-    int LRDecayEpochs;
-    bool EnableEarlyStopping;
-    int EarlyStoppingPatience;
-
-    TMultiLayerPerceptronOpenCL(int InputSize, const std::vector<int>& HiddenSizes, int OutputSize,
-                                 TActivationType HiddenAct = atSigmoid, TActivationType OutputAct = atSigmoid) {
-        LearningRate = 0.1;
-        MaxIterations = 100;
-        Optimizer = otSGD;
-        HiddenActivation = HiddenAct;
-        OutputActivation = OutputAct;
-        DropoutRate = 0;
-        L2Lambda = 0;
-        Beta1 = 0.9;
-        Beta2 = 0.999;
-        Timestep = 0;
-        EnableLRDecay = false;
-        LRDecayRate = 0.95;
-        LRDecayEpochs = 10;
-        EnableEarlyStopping = false;
-        EarlyStoppingPatience = 10;
-        FIsTraining = true;
-
-        FInputSize = InputSize;
-        FOutputSize = OutputSize;
-        FHiddenSizes = HiddenSizes;
-
-        InitOpenCL();
-
-        NumLayers = HiddenSizes.size() + 2;
-        Layers = new LayerData[NumLayers];
-        memset(Layers, 0, NumLayers * sizeof(LayerData));
-
-        AllocateLayer(Layers[0], InputSize + 1, InputSize, atSigmoid);
-
-        MaxNeurons = InputSize + 1;
-        int numInputs = InputSize;
-        for (size_t i = 0; i < HiddenSizes.size(); i++) {
-            AllocateLayer(Layers[i + 1], HiddenSizes[i] + 1, numInputs + 1, HiddenActivation);
-            if (HiddenSizes[i] + 1 > MaxNeurons) MaxNeurons = HiddenSizes[i] + 1;
-            numInputs = HiddenSizes[i];
-        }
-
-        AllocateLayer(Layers[NumLayers - 1], OutputSize, numInputs + 1, OutputActivation);
-        if (OutputSize > MaxNeurons) MaxNeurons = OutputSize;
-
-        cl_int err;
-        d_Target = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
-        CL_CHECK(err);
-        d_SoftmaxSums = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
-        CL_CHECK(err);
-    }
-
-    ~TMultiLayerPerceptronOpenCL() {
-        for (int i = 0; i < NumLayers; i++)
-            FreeLayer(Layers[i]);
-        delete[] Layers;
-
-        clReleaseMemObject(d_Target);
-        clReleaseMemObject(d_SoftmaxSums);
-
-        clReleaseKernel(feedForwardKernel);
-        clReleaseKernel(feedForwardSoftmaxSumKernel);
-        clReleaseKernel(softmaxKernel);
-        clReleaseKernel(applyDropoutKernel);
-        clReleaseKernel(backPropOutputKernel);
-        clReleaseKernel(backPropHiddenKernel);
-        clReleaseKernel(updateWeightsSGDKernel);
-        clReleaseKernel(updateWeightsAdamKernel);
-        clReleaseKernel(updateWeightsRMSPropKernel);
-
-        clReleaseProgram(program);
-        clReleaseCommandQueue(queue);
-        clReleaseContext(context);
     }
 
     void FeedForward() {
@@ -752,44 +671,141 @@ public:
         clFinish(queue);
     }
 
-    void Predict(const float* Input, float* Result) {
+public:
+    float LearningRate;
+    int MaxIterations;
+    TOptimizerType Optimizer;
+    TActivationType HiddenActivation;
+    TActivationType OutputActivation;
+    float DropoutRate;
+    float L2Lambda;
+    float Beta1;
+    float Beta2;
+    int Timestep;
+    bool EnableLRDecay;
+    float LRDecayRate;
+    int LRDecayEpochs;
+    bool EnableEarlyStopping;
+    int EarlyStoppingPatience;
+
+    TMultiLayerPerceptronOpenCLFacaded(
+        int InputSize, const std::vector<int>& HiddenSizes, int OutputSize,
+        TActivationType HiddenAct = atSigmoid, TActivationType OutputAct = atSigmoid
+    ) {
+        LearningRate = 0.1f;
+        MaxIterations = 100;
+        Optimizer = otSGD;
+        HiddenActivation = HiddenAct;
+        OutputActivation = OutputAct;
+        DropoutRate = 0;
+        L2Lambda = 0;
+        Beta1 = 0.9f;
+        Beta2 = 0.999f;
+        Timestep = 0;
+        EnableLRDecay = false;
+        LRDecayRate = 0.95f;
+        LRDecayEpochs = 10;
+        EnableEarlyStopping = false;
+        EarlyStoppingPatience = 10;
+        FIsTraining = true;
+
+        FInputSize = InputSize;
+        FOutputSize = OutputSize;
+        FHiddenSizes = HiddenSizes;
+
+        InitOpenCL();
+
+        NumLayers = HiddenSizes.size() + 2;
+        Layers = new LayerData[NumLayers];
+        memset(Layers, 0, NumLayers * sizeof(LayerData));
+
+        AllocateLayer(Layers[0], InputSize + 1, InputSize, atSigmoid);
+
+        MaxNeurons = InputSize + 1;
+        int numInputs = InputSize;
+        for (size_t i = 0; i < HiddenSizes.size(); i++) {
+            AllocateLayer(Layers[i + 1], HiddenSizes[i] + 1, numInputs + 1, HiddenActivation);
+            if (HiddenSizes[i] + 1 > MaxNeurons) MaxNeurons = HiddenSizes[i] + 1;
+            numInputs = HiddenSizes[i];
+        }
+
+        AllocateLayer(Layers[NumLayers - 1], OutputSize, numInputs + 1, OutputActivation);
+        if (OutputSize > MaxNeurons) MaxNeurons = OutputSize;
+
+        cl_int err;
+        d_Target = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        d_SoftmaxSums = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+    }
+
+    ~TMultiLayerPerceptronOpenCLFacaded() {
+        for (int i = 0; i < NumLayers; i++)
+            FreeLayer(Layers[i]);
+        delete[] Layers;
+
+        clReleaseMemObject(d_Target);
+        clReleaseMemObject(d_SoftmaxSums);
+
+        clReleaseKernel(feedForwardKernel);
+        clReleaseKernel(feedForwardSoftmaxSumKernel);
+        clReleaseKernel(softmaxKernel);
+        clReleaseKernel(applyDropoutKernel);
+        clReleaseKernel(backPropOutputKernel);
+        clReleaseKernel(backPropHiddenKernel);
+        clReleaseKernel(updateWeightsSGDKernel);
+        clReleaseKernel(updateWeightsAdamKernel);
+        clReleaseKernel(updateWeightsRMSPropKernel);
+
+        clReleaseProgram(program);
+        clReleaseCommandQueue(queue);
+        clReleaseContext(context);
+    }
+
+    void Predict(const double* Input, double* Result) {
         FIsTraining = false;
 
         float* h_input = new float[FInputSize + 1];
-        for (int i = 0; i < FInputSize; i++) h_input[i] = Input[i];
-        h_input[FInputSize] = 1.0;
+        for (int i = 0; i < FInputSize; i++) h_input[i] = (float)Input[i];
+        h_input[FInputSize] = 1.0f;
         clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
         delete[] h_input;
 
         FeedForward();
 
-        clEnqueueReadBuffer(queue, Layers[NumLayers - 1].Outputs, CL_TRUE, 0, FOutputSize * sizeof(float), Result, 0, NULL, NULL);
+        float* h_output = new float[FOutputSize];
+        clEnqueueReadBuffer(queue, Layers[NumLayers - 1].Outputs, CL_TRUE, 0, FOutputSize * sizeof(float), h_output, 0, NULL, NULL);
+        for (int i = 0; i < FOutputSize; i++) Result[i] = (double)h_output[i];
+        delete[] h_output;
 
         FIsTraining = true;
     }
 
-    void Train(const float* Input, const float* Target) {
+    void Train(const double* Input, const double* Target) {
         FIsTraining = true;
 
         float* h_input = new float[FInputSize + 1];
-        for (int i = 0; i < FInputSize; i++) h_input[i] = Input[i];
-        h_input[FInputSize] = 1.0;
+        for (int i = 0; i < FInputSize; i++) h_input[i] = (float)Input[i];
+        h_input[FInputSize] = 1.0f;
         clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
         delete[] h_input;
 
-        clEnqueueWriteBuffer(queue, d_Target, CL_TRUE, 0, FOutputSize * sizeof(float), Target, 0, NULL, NULL);
+        float* h_target = new float[FOutputSize];
+        for (int i = 0; i < FOutputSize; i++) h_target[i] = (float)Target[i];
+        clEnqueueWriteBuffer(queue, d_Target, CL_TRUE, 0, FOutputSize * sizeof(float), h_target, 0, NULL, NULL);
+        delete[] h_target;
 
         FeedForward();
         BackPropagate();
         UpdateWeights();
     }
 
-    float ComputeLoss(const float* Predicted, const float* Target) {
-        float Result = 0;
+    double ComputeLoss(const double* Predicted, const double* Target) {
+        double Result = 0;
 
         if (OutputActivation == atSoftmax) {
             for (int i = 0; i < FOutputSize; i++) {
-                float p = Predicted[i];
+                double p = Predicted[i];
                 if (p < EPSILON) p = EPSILON;
                 if (p > 1 - EPSILON) p = 1 - EPSILON;
                 Result -= Target[i] * log(p);
@@ -811,6 +827,124 @@ public:
     int GetLayerSize(int layerIdx) const {
         if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
         return Layers[layerIdx].NumNeurons;
+    }
+
+    TActivationType GetLayerActivation(int layerIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return atSigmoid;
+        return Layers[layerIdx].ActivationType;
+    }
+
+    double GetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
+        float value;
+        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
+        clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, idx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    void SetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx, double value) {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return;
+        float fval = (float)value;
+        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
+        clEnqueueWriteBuffer(queue, layer.Weights, CL_TRUE, idx * sizeof(float), sizeof(float), &fval, 0, NULL, NULL);
+    }
+
+    std::vector<double> GetNeuronWeights(int layerIdx, int neuronIdx) const {
+        std::vector<double> result;
+        if (layerIdx < 0 || layerIdx >= NumLayers) return result;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return result;
+        float* values = new float[layer.NumInputs];
+        size_t offset = neuronIdx * layer.NumInputs;
+        clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, offset * sizeof(float), layer.NumInputs * sizeof(float), values, 0, NULL, NULL);
+        for (int i = 0; i < layer.NumInputs; i++)
+            result.push_back((double)values[i]);
+        delete[] values;
+        return result;
+    }
+
+    double GetNeuronBias(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.Biases, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    void SetNeuronBias(int layerIdx, int neuronIdx, double value) {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
+        float fval = (float)value;
+        clEnqueueWriteBuffer(queue, layer.Biases, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &fval, 0, NULL, NULL);
+    }
+
+    double GetNeuronOutput(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.Outputs, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    double GetNeuronError(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.Errors, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    std::vector<double> GetLayerOutputs(int layerIdx) const {
+        std::vector<double> result;
+        if (layerIdx < 0 || layerIdx >= NumLayers) return result;
+        LayerData& layer = Layers[layerIdx];
+        float* values = new float[layer.NumNeurons];
+        clEnqueueReadBuffer(queue, layer.Outputs, CL_TRUE, 0, layer.NumNeurons * sizeof(float), values, 0, NULL, NULL);
+        for (int i = 0; i < layer.NumNeurons; i++)
+            result.push_back((double)values[i]);
+        delete[] values;
+        return result;
+    }
+
+    std::vector<int> GetActivationHistogram(int layerIdx, int bins) const {
+        std::vector<int> hist(bins, 0);
+        if (layerIdx < 0 || layerIdx >= NumLayers) return hist;
+        LayerData& layer = Layers[layerIdx];
+        std::vector<double> outputs = GetLayerOutputs(layerIdx);
+        for (auto val : outputs) {
+            int idx = (int)(val * bins);
+            if (idx < 0) idx = 0;
+            if (idx >= bins) idx = bins - 1;
+            hist[idx]++;
+        }
+        return hist;
+    }
+
+    std::vector<int> GetErrorHistogram(int layerIdx, int bins) const {
+        std::vector<int> hist(bins, 0);
+        if (layerIdx < 0 || layerIdx >= NumLayers) return hist;
+        LayerData& layer = Layers[layerIdx];
+        float* values = new float[layer.NumNeurons];
+        clEnqueueReadBuffer(queue, layer.Errors, CL_TRUE, 0, layer.NumNeurons * sizeof(float), values, 0, NULL, NULL);
+        for (int i = 0; i < layer.NumNeurons; i++) {
+            double absErr = fabs((double)values[i]);
+            int idx = (int)(absErr * bins);
+            if (idx < 0) idx = 0;
+            if (idx >= bins) idx = bins - 1;
+            hist[idx]++;
+        }
+        delete[] values;
+        return hist;
     }
 
     bool Save(const char* filename) {
@@ -879,7 +1013,7 @@ public:
         return true;
     }
 
-    static TMultiLayerPerceptronOpenCL* Load(const char* filename) {
+    static TMultiLayerPerceptronOpenCLFacaded* Load(const char* filename) {
         FILE* f = fopen(filename, "rb");
         if (!f) return nullptr;
 
@@ -905,7 +1039,7 @@ public:
         fread(&hidAct, sizeof(int), 1, f);
         fread(&outAct, sizeof(int), 1, f);
 
-        TMultiLayerPerceptronOpenCL* mlp = new TMultiLayerPerceptronOpenCL(
+        TMultiLayerPerceptronOpenCLFacaded* mlp = new TMultiLayerPerceptronOpenCLFacaded(
             inputSize, hiddenSizes, outputSize,
             (TActivationType)hidAct, (TActivationType)outAct);
 
@@ -959,14 +1093,51 @@ public:
         fclose(f);
         return mlp;
     }
+
+    double GetWeightM(int layerIdx, int neuronIdx, int weightIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
+        float value;
+        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
+        clEnqueueReadBuffer(queue, layer.M, CL_TRUE, idx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+    double GetWeightV(int layerIdx, int neuronIdx, int weightIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
+        float value;
+        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
+        clEnqueueReadBuffer(queue, layer.V, CL_TRUE, idx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+    double GetBiasM(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.MBias, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+    double GetBiasV(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.VBias, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
 };
 
-// Utility functions and main() remain the same as CUDA version, just using OpenCL class
-float RandomDouble() {
-    return (float)rand() / RAND_MAX;
+// Utility functions
+double RandomDouble() {
+    return (double)rand() / RAND_MAX;
 }
 
-int MaxIndex(const float* arr, int n) {
+int MaxIndex(const double* arr, int n) {
     int result = 0;
     for (int i = 1; i < n; i++)
         if (arr[i] > arr[result])
@@ -975,8 +1146,8 @@ int MaxIndex(const float* arr, int n) {
 }
 
 struct DataPoint {
-    std::vector<float> Input;
-    std::vector<float> Target;
+    std::vector<double> Input;
+    std::vector<double> Target;
 };
 
 const char* ActivationToStr(TActivationType act) {
@@ -1021,8 +1192,8 @@ std::vector<int> ParseIntArray(const char* s) {
     return result;
 }
 
-std::vector<float> ParseDoubleArray(const char* s) {
-    std::vector<float> result;
+std::vector<double> ParseDoubleArray(const char* s) {
+    std::vector<double> result;
     std::stringstream ss(s);
     std::string token;
     while (std::getline(ss, token, ',')) {
@@ -1039,7 +1210,7 @@ std::vector<DataPoint> LoadDataCSV(const char* filename, int inputSize, int outp
     std::string line;
     while (std::getline(file, line)) {
         if (line.empty()) continue;
-        std::vector<float> values = ParseDoubleArray(line.c_str());
+        std::vector<double> values = ParseDoubleArray(line.c_str());
         if ((int)values.size() < inputSize + outputSize) continue;
 
         DataPoint dp;
@@ -1063,7 +1234,7 @@ void NormalizeData(std::vector<DataPoint>& data) {
     if (data.empty()) return;
     int inputSize = data[0].Input.size();
 
-    std::vector<float> mins(inputSize), maxs(inputSize);
+    std::vector<double> mins(inputSize), maxs(inputSize);
     for (int j = 0; j < inputSize; j++) {
         mins[j] = maxs[j] = data[0].Input[j];
     }
@@ -1075,181 +1246,158 @@ void NormalizeData(std::vector<DataPoint>& data) {
     }
     for (auto& dp : data) {
         for (int j = 0; j < inputSize; j++) {
-            float range = maxs[j] - mins[j];
+            double range = maxs[j] - mins[j];
             dp.Input[j] = (range > 0) ? (dp.Input[j] - mins[j]) / range : 0.5;
         }
     }
 }
 
 void PrintUsage() {
-    printf("MLP OpenCL - Command-line Multi-Layer Perceptron\n");
-    printf("\n");
-    printf("Commands:\n");
-    printf("  create   Create a new MLP model\n");
-    printf("  train    Train an existing model with data\n");
-    printf("  predict  Make predictions with a trained model\n");
-    printf("  info     Display model information\n");
-    printf("  help     Show this help message\n");
-    printf("\n");
-    printf("Create Options:\n");
-    printf("  --input=N              Input layer size (required)\n");
-    printf("  --hidden=N,N,...       Hidden layer sizes (required)\n");
-    printf("  --output=N             Output layer size (required)\n");
-    printf("  --save=FILE            Save model to file (required)\n");
-    printf("  --lr=VALUE             Learning rate (default: 0.1)\n");
-    printf("  --optimizer=TYPE       sgd|adam|rmsprop (default: sgd)\n");
-    printf("  --hidden-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
-    printf("  --output-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
-    printf("  --dropout=VALUE        Dropout rate 0-1 (default: 0)\n");
-    printf("  --l2=VALUE             L2 regularization (default: 0)\n");
-    printf("  --beta1=VALUE          Adam beta1 (default: 0.9)\n");
-    printf("  --beta2=VALUE          Adam beta2 (default: 0.999)\n");
-    printf("\n");
-    printf("Train Options:\n");
-    printf("  --model=FILE           Model file to load (required)\n");
-    printf("  --data=FILE            Training data CSV file (required)\n");
-    printf("  --save=FILE            Save trained model to file (required)\n");
-    printf("  --epochs=N             Number of training epochs (default: 100)\n");
-    printf("  --batch=N              Batch size (default: 1)\n");
-    printf("  --lr=VALUE             Override learning rate\n");
-    printf("  --lr-decay             Enable learning rate decay\n");
-    printf("  --lr-decay-rate=VALUE  LR decay rate (default: 0.95)\n");
-    printf("  --lr-decay-epochs=N    Epochs between decay (default: 10)\n");
-    printf("  --early-stop           Enable early stopping\n");
-    printf("  --patience=N           Early stopping patience (default: 10)\n");
-    printf("  --normalize            Normalize input data\n");
-    printf("  --verbose              Show training progress\n");
-    printf("\n");
-    printf("Predict Options:\n");
-    printf("  --model=FILE           Model file to load (required)\n");
-    printf("  --input=v1,v2,...      Input values (required)\n");
-    printf("\n");
-    printf("Info Options:\n");
-    printf("  --model=FILE           Model file to load (required)\n");
-    printf("\n");
-    printf("Examples:\n");
-    printf("  mlp_opencl create --input=2 --hidden=4,4 --output=1 --save=xor.bin\n");
-    printf("  mlp_opencl train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin\n");
-    printf("  mlp_opencl predict --model=xor_trained.bin --input=1,0\n");
-    printf("  mlp_opencl info --model=xor_trained.bin\n");
+    printf("Facaded MLP OpenCL - Command-line Multi-Layer Perceptron (w/ Facade)\n\n");
+    printf("Commands:\n"
+        "  create      Create a new model\n"
+        "  train       Train model with data\n"
+        "  predict     Predict output\n"
+        "  info        Print model info\n"
+        "  get-weight  Get a weight value\n"
+        "  set-weight  Set a weight value\n"
+        "  get-weights Get all weights\n"
+        "  get-bias    Get bias value\n"
+        "  set-bias    Set bias value\n"
+        "  get-output  Get neuron output\n"
+        "  get-error   Get error\n"
+        "  layer-info  Print layer info\n"
+        "  histogram   Print activation histogram\n"
+        "  get-optimizer Print optimizer value\n"
+        "  help        Print usage\n");
 }
 
 int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
-
     if (argc < 2) {
         PrintUsage();
         return 0;
     }
 
-    TCommand command = cmdNone;
     std::string cmdStr = argv[1];
+    TCommand command = cmdNone;
     if (cmdStr == "create") command = cmdCreate;
     else if (cmdStr == "train") command = cmdTrain;
     else if (cmdStr == "predict") command = cmdPredict;
     else if (cmdStr == "info") command = cmdInfo;
     else if (cmdStr == "help" || cmdStr == "--help" || cmdStr == "-h") command = cmdHelp;
+    else if (cmdStr == "get-weight") command = cmdGetWeight;
+    else if (cmdStr == "set-weight") command = cmdSetWeight;
+    else if (cmdStr == "get-weights") command = cmdGetWeights;
+    else if (cmdStr == "get-bias") command = cmdGetBias;
+    else if (cmdStr == "set-bias") command = cmdSetBias;
+    else if (cmdStr == "get-output") command = cmdGetOutput;
+    else if (cmdStr == "get-error") command = cmdGetError;
+    else if (cmdStr == "layer-info") command = cmdLayerInfo;
+    else if (cmdStr == "histogram") command = cmdHistogram;
+    else if (cmdStr == "get-optimizer") command = cmdGetOptimizer;
     else {
         printf("Unknown command: %s\n", argv[1]);
         PrintUsage();
         return 1;
     }
-
     if (command == cmdHelp) {
         PrintUsage();
         return 0;
     }
 
-    int inputSize = 0, outputSize = 0;
+    // CLI argument parsing
+    int inputSize = 0, outputSize = 0, layerIdx = -1, neuronIdx = -1, weightIdx = -1, valueInt = -1;
     std::vector<int> hiddenSizes;
-    std::vector<float> inputValues;
+    std::vector<double> inputValues;
     std::string modelFile, saveFile, dataFile;
-    float learningRate = 0.1;
+    double learningRate = 0.1;
     TOptimizerType optimizer = otSGD;
     TActivationType hiddenAct = atSigmoid, outputAct = atSigmoid;
-    float dropoutRate = 0, l2Lambda = 0, beta1 = 0.9, beta2 = 0.999;
+    double dropoutRate = 0, l2Lambda = 0, beta1 = 0.9, beta2 = 0.999;
     int epochs = 100, batchSize = 1;
     bool lrDecay = false, earlyStop = false, normalize = false, verbose = false;
-    float lrDecayRate = 0.95;
+    double lrDecayRate = 0.95;
     int lrDecayEpochs = 10, patience = 10;
     bool lrOverride = false;
+    double value = 0;
+    int histBins = 20;
+    std::string histType = "activation";
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
-
         if (arg == "--lr-decay") { lrDecay = true; continue; }
         if (arg == "--early-stop") { earlyStop = true; continue; }
         if (arg == "--normalize") { normalize = true; continue; }
         if (arg == "--verbose") { verbose = true; continue; }
-
         size_t eq = arg.find('=');
         if (eq == std::string::npos) {
             printf("Invalid argument: %s\n", arg.c_str());
             continue;
         }
-
         std::string key = arg.substr(0, eq);
-        std::string value = arg.substr(eq + 1);
+        std::string valueStr = arg.substr(eq + 1);
 
         if (key == "--input") {
-            if (command == cmdPredict)
-                inputValues = ParseDoubleArray(value.c_str());
+            if (command == cmdPredict || command == cmdGetOutput)
+                inputValues = ParseDoubleArray(valueStr.c_str());
             else
-                inputSize = atoi(value.c_str());
+                inputSize = atoi(valueStr.c_str());
         }
-        else if (key == "--hidden") hiddenSizes = ParseIntArray(value.c_str());
-        else if (key == "--output") outputSize = atoi(value.c_str());
-        else if (key == "--model") modelFile = value;
-        else if (key == "--save") saveFile = value;
-        else if (key == "--data") dataFile = value;
-        else if (key == "--lr") { learningRate = atof(value.c_str()); lrOverride = true; }
-        else if (key == "--optimizer") optimizer = ParseOptimizer(value.c_str());
-        else if (key == "--hidden-act") hiddenAct = ParseActivation(value.c_str());
-        else if (key == "--output-act") outputAct = ParseActivation(value.c_str());
-        else if (key == "--dropout") dropoutRate = atof(value.c_str());
-        else if (key == "--l2") l2Lambda = atof(value.c_str());
-        else if (key == "--beta1") beta1 = atof(value.c_str());
-        else if (key == "--beta2") beta2 = atof(value.c_str());
-        else if (key == "--epochs") epochs = atoi(value.c_str());
-        else if (key == "--batch") batchSize = atoi(value.c_str());
-        else if (key == "--lr-decay-rate") lrDecayRate = atof(value.c_str());
-        else if (key == "--lr-decay-epochs") lrDecayEpochs = atoi(value.c_str());
-        else if (key == "--patience") patience = atoi(value.c_str());
+        else if (key == "--hidden") hiddenSizes = ParseIntArray(valueStr.c_str());
+        else if (key == "--output") outputSize = atoi(valueStr.c_str());
+        else if (key == "--model") modelFile = valueStr;
+        else if (key == "--save") saveFile = valueStr;
+        else if (key == "--data") dataFile = valueStr;
+        else if (key == "--lr") { learningRate = atof(valueStr.c_str()); lrOverride = true; }
+        else if (key == "--optimizer") optimizer = ParseOptimizer(valueStr.c_str());
+        else if (key == "--hidden-act") hiddenAct = ParseActivation(valueStr.c_str());
+        else if (key == "--output-act") outputAct = ParseActivation(valueStr.c_str());
+        else if (key == "--dropout") dropoutRate = atof(valueStr.c_str());
+        else if (key == "--l2") l2Lambda = atof(valueStr.c_str());
+        else if (key == "--beta1") beta1 = atof(valueStr.c_str());
+        else if (key == "--beta2") beta2 = atof(valueStr.c_str());
+        else if (key == "--epochs") epochs = atoi(valueStr.c_str());
+        else if (key == "--batch") batchSize = atoi(valueStr.c_str());
+        else if (key == "--lr-decay-rate") lrDecayRate = atof(valueStr.c_str());
+        else if (key == "--lr-decay-epochs") lrDecayEpochs = atoi(valueStr.c_str());
+        else if (key == "--patience") patience = atoi(valueStr.c_str());
+        else if (key == "--layer") layerIdx = atoi(valueStr.c_str());
+        else if (key == "--neuron") neuronIdx = atoi(valueStr.c_str());
+        else if (key == "--weight") weightIdx = atoi(valueStr.c_str());
+        else if (key == "--value") value = atof(valueStr.c_str());
+        else if (key == "--bins") histBins = atoi(valueStr.c_str());
+        else if (key == "--type") histType = valueStr;
         else printf("Unknown option: %s\n", key.c_str());
     }
 
+    // Device info (first available device)
     cl_platform_id platform;
     cl_device_id device;
     char deviceName[128];
-
-    if (clGetPlatformIDs(1, &platform, NULL) != CL_SUCCESS) {
-        printf("Error: No OpenCL platforms found!\n");
+    if (clGetPlatformIDs(1, &platform, NULL) != CL_SUCCESS ||
+        (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL) != CL_SUCCESS &&
+         clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL) != CL_SUCCESS)) {
+        printf("Error: No OpenCL devices found!\n");
         return 1;
     }
-
-    if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL) != CL_SUCCESS) {
-        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &device, NULL) != CL_SUCCESS) {
-            printf("Error: No OpenCL devices found!\n");
-            return 1;
-        }
-    }
-
     clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(deviceName), deviceName, NULL);
 
+    // Command dispatcher
     if (command == cmdCreate) {
         if (inputSize <= 0) { printf("Error: --input is required\n"); return 1; }
         if (hiddenSizes.empty()) { printf("Error: --hidden is required\n"); return 1; }
         if (outputSize <= 0) { printf("Error: --output is required\n"); return 1; }
         if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
 
-        TMultiLayerPerceptronOpenCL* mlp = new TMultiLayerPerceptronOpenCL(
+        TMultiLayerPerceptronOpenCLFacaded* mlp = new TMultiLayerPerceptronOpenCLFacaded(
             inputSize, hiddenSizes, outputSize, hiddenAct, outputAct);
-        mlp->LearningRate = learningRate;
+        mlp->LearningRate = (float)learningRate;
         mlp->Optimizer = optimizer;
-        mlp->DropoutRate = dropoutRate;
-        mlp->L2Lambda = l2Lambda;
-        mlp->Beta1 = beta1;
-        mlp->Beta2 = beta2;
+        mlp->DropoutRate = (float)dropoutRate;
+        mlp->L2Lambda = (float)l2Lambda;
+        mlp->Beta1 = (float)beta1;
+        mlp->Beta2 = (float)beta2;
 
         mlp->Save(saveFile.c_str());
 
@@ -1273,12 +1421,12 @@ int main(int argc, char** argv) {
         if (dataFile.empty()) { printf("Error: --data is required\n"); return 1; }
         if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
 
-        TMultiLayerPerceptronOpenCL* mlp = TMultiLayerPerceptronOpenCL::Load(modelFile.c_str());
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
         if (!mlp) { printf("Error: Failed to load model: %s\n", modelFile.c_str()); return 1; }
 
-        if (lrOverride) mlp->LearningRate = learningRate;
+        if (lrOverride) mlp->LearningRate = (float)learningRate;
         mlp->EnableLRDecay = lrDecay;
-        mlp->LRDecayRate = lrDecayRate;
+        mlp->LRDecayRate = (float)lrDecayRate;
         mlp->LRDecayEpochs = lrDecayEpochs;
         mlp->EnableEarlyStopping = earlyStop;
         mlp->EarlyStoppingPatience = patience;
@@ -1296,7 +1444,7 @@ int main(int argc, char** argv) {
             printf("Data normalized\n");
         }
 
-        float* output = new float[mlp->GetOutputSize()];
+        double* output = new double[mlp->GetOutputSize()];
 
         for (int epoch = 1; epoch <= epochs; epoch++) {
             ShuffleData(data);
@@ -1305,7 +1453,7 @@ int main(int argc, char** argv) {
                 mlp->Train(dp.Input.data(), dp.Target.data());
 
             if (verbose && (epoch % 10 == 0 || epoch == 1)) {
-                float totalLoss = 0;
+                double totalLoss = 0;
                 for (auto& dp : data) {
                     mlp->Predict(dp.Input.data(), output);
                     totalLoss += mlp->ComputeLoss(output, dp.Target.data());
@@ -1314,7 +1462,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        float totalLoss = 0;
+        double totalLoss = 0;
         for (auto& dp : data) {
             mlp->Predict(dp.Input.data(), output);
             totalLoss += mlp->ComputeLoss(output, dp.Target.data());
@@ -1329,71 +1477,167 @@ int main(int argc, char** argv) {
         delete mlp;
     }
     else if (command == cmdPredict) {
-        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
-        if (inputValues.empty()) { printf("Error: --input is required\n"); return 1; }
-
-        TMultiLayerPerceptronOpenCL* mlp = TMultiLayerPerceptronOpenCL::Load(modelFile.c_str());
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (inputValues.empty()) { printf("Error: --input required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
         if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
-
         if ((int)inputValues.size() != mlp->GetInputSize()) {
-            printf("Error: Expected %d input values, got %zu\n", mlp->GetInputSize(), inputValues.size());
-            delete mlp;
-            return 1;
+            printf("Error: Expected %d input values\n", mlp->GetInputSize()); delete mlp; return 1;
         }
-
-        float* output = new float[mlp->GetOutputSize()];
+        double* output = new double[mlp->GetOutputSize()];
         mlp->Predict(inputValues.data(), output);
-
-        printf("Input: ");
-        for (size_t i = 0; i < inputValues.size(); i++)
-            printf("%s%.4f", i > 0 ? ", " : "", inputValues[i]);
-        printf("\n");
-
-        printf("Output: ");
-        for (int i = 0; i < mlp->GetOutputSize(); i++)
-            printf("%s%.6f", i > 0 ? ", " : "", output[i]);
-        printf("\n");
-
+        printf("Input: "); for (size_t i = 0; i < inputValues.size(); i++)
+            printf("%s%.4f", i > 0 ? ", " : "", inputValues[i]); printf("\n");
+        printf("Output: "); for (int i = 0; i < mlp->GetOutputSize(); i++)
+            printf("%s%.6f", i > 0 ? ", " : "", output[i]); printf("\n");
         if (mlp->GetOutputSize() > 1)
             printf("Max index: %d\n", MaxIndex(output, mlp->GetOutputSize()));
-
         delete[] output;
         delete mlp;
     }
     else if (command == cmdInfo) {
-        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
-
-        TMultiLayerPerceptronOpenCL* mlp = TMultiLayerPerceptronOpenCL::Load(modelFile.c_str());
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
         if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
-
-        printf("MLP Model Information (OpenCL)\n");
+        printf("MLP Model Information (OpenCL Facade)\n");
         printf("==============================\n");
         printf("Device: %s\n", deviceName);
         printf("Input size: %d\n", mlp->GetInputSize());
         printf("Output size: %d\n", mlp->GetOutputSize());
         printf("Hidden layers: %d\n", mlp->GetHiddenLayerCount());
-        printf("Layer sizes: %d", mlp->GetInputSize());
-        for (int h : mlp->GetHiddenSizes())
-            printf(" -> %d", h);
-        printf(" -> %d\n", mlp->GetOutputSize());
-        printf("\n");
-        printf("Hyperparameters:\n");
-        printf("  Learning rate: %.6f\n", mlp->LearningRate);
-        printf("  Optimizer: %s\n", OptimizerToStr(mlp->Optimizer));
-        printf("  Hidden activation: %s\n", ActivationToStr(mlp->HiddenActivation));
-        printf("  Output activation: %s\n", ActivationToStr(mlp->OutputActivation));
-        printf("  Dropout rate: %.4f\n", mlp->DropoutRate);
-        printf("  L2 lambda: %.6f\n", mlp->L2Lambda);
-        printf("  Beta1: %.4f\n", mlp->Beta1);
-        printf("  Beta2: %.4f\n", mlp->Beta2);
-        printf("  Timestep: %d\n", mlp->Timestep);
-        printf("\n");
+        printf("Layer sizes: %d", mlp->GetInputSize()); for (int h : mlp->GetHiddenSizes())
+            printf(" -> %d", h); printf(" -> %d\n", mlp->GetOutputSize());
+        printf("Learning rate: %.6f\n", mlp->LearningRate);
+        printf("Optimizer: %s\n", OptimizerToStr(mlp->Optimizer));
+        printf("Hidden activation: %s\n", ActivationToStr(mlp->HiddenActivation));
+        printf("Output activation: %s\n", ActivationToStr(mlp->OutputActivation));
+        printf("Dropout rate: %.4f\n", mlp->DropoutRate);
+        printf("L2 lambda: %.6f\n", mlp->L2Lambda);
+        printf("Beta1: %.4f\n", mlp->Beta1); printf("Beta2: %.4f\n", mlp->Beta2); printf("Timestep: %d\n", mlp->Timestep);
         printf("Total layers: %d\n", mlp->GetNumLayers());
         for (int i = 0; i < mlp->GetNumLayers(); i++)
             printf("  Layer %d: %d neurons\n", i, mlp->GetLayerSize(i));
-
         delete mlp;
     }
-
+    // --- Facade commands ---
+    else if (command == cmdGetWeight) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0 || weightIdx < 0) { printf("Error: --layer --neuron --weight required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        double w = mlp->GetNeuronWeight(layerIdx, neuronIdx, weightIdx);
+        printf("Weight [%d][%d][%d]: %.7f\n", layerIdx, neuronIdx, weightIdx, w);
+        delete mlp;
+    }
+    else if (command == cmdSetWeight) {
+        if (modelFile.empty() || saveFile.empty()) { printf("Error: --model and --save required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0 || weightIdx < 0) { printf("Error: --layer --neuron --weight required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        mlp->SetNeuronWeight(layerIdx, neuronIdx, weightIdx, value);
+        printf("Set Weight[%d][%d][%d] = %.7f\n", layerIdx, neuronIdx, weightIdx, value);
+        mlp->Save(saveFile.c_str());
+        printf("Model saved to: %s\n", saveFile.c_str());
+        delete mlp;
+    }
+    else if (command == cmdGetWeights) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0) { printf("Error: --layer --neuron required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        std::vector<double> weights = mlp->GetNeuronWeights(layerIdx, neuronIdx);
+        printf("Weights [%d][%d]: ", layerIdx, neuronIdx);
+        for (size_t i = 0; i < weights.size(); i++)
+            printf("%s%.7f", i > 0 ? ", " : "", weights[i]);
+        printf("\n");
+        delete mlp;
+    }
+    else if (command == cmdGetBias) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0) { printf("Error: --layer --neuron required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        double b = mlp->GetNeuronBias(layerIdx, neuronIdx);
+        printf("Bias [%d][%d]: %.7f\n", layerIdx, neuronIdx, b);
+        delete mlp;
+    }
+    else if (command == cmdSetBias) {
+        if (modelFile.empty() || saveFile.empty()) { printf("Error: --model and --save required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0) { printf("Error: --layer --neuron required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        mlp->SetNeuronBias(layerIdx, neuronIdx, value);
+        printf("Set Bias[%d][%d] = %.7f\n", layerIdx, neuronIdx, value);
+        mlp->Save(saveFile.c_str());
+        printf("Model saved to: %s\n", saveFile.c_str());
+        delete mlp;
+    }
+    else if (command == cmdGetOutput) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0) { printf("Error: --layer --neuron required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        if (!inputValues.empty()) {
+            if ((int)inputValues.size() != mlp->GetInputSize()) {
+                printf("Error: Expected %d input values\n", mlp->GetInputSize()); delete mlp; return 1;
+            }
+            double* tmp = new double[mlp->GetOutputSize()];
+            mlp->Predict(inputValues.data(), tmp);
+            delete[] tmp;
+        }
+        double out = mlp->GetNeuronOutput(layerIdx, neuronIdx);
+        printf("Output [%d][%d]: %.7f\n", layerIdx, neuronIdx, out);
+        delete mlp;
+    }
+    else if (command == cmdGetError) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0) { printf("Error: --layer --neuron required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        double err = mlp->GetNeuronError(layerIdx, neuronIdx);
+        printf("Error [%d][%d]: %.7f\n", layerIdx, neuronIdx, err);
+        delete mlp;
+    }
+    else if (command == cmdLayerInfo) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        printf("Layer %d info:\n", layerIdx);
+        printf(" Size: %d\n", mlp->GetLayerSize(layerIdx));
+        printf(" Activation: %s\n", ActivationToStr(mlp->GetLayerActivation(layerIdx)));
+        printf(" Outputs: ");
+        std::vector<double> outs = mlp->GetLayerOutputs(layerIdx);
+        for (size_t i = 0; i < outs.size(); i++) printf("%s%.7f", i > 0 ? ", " : "", outs[i]);
+        printf("\n");
+        delete mlp;
+    }
+    else if (command == cmdHistogram) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0) { printf("Error: --layer required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        std::vector<int> hist;
+        if (histType == "error")
+            hist = mlp->GetErrorHistogram(layerIdx, histBins);
+        else
+            hist = mlp->GetActivationHistogram(layerIdx, histBins);
+        printf("Histogram (%s) for layer %d:\n", histType.c_str(), layerIdx);
+        for (size_t i = 0; i < hist.size(); i++)
+            printf(" Bin %2zu: %d\n", i, hist[i]);
+        delete mlp;
+    }
+    else if (command == cmdGetOptimizer) {
+        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
+        if (layerIdx < 0 || neuronIdx < 0) { printf("Error: --layer --neuron required\n"); return 1; }
+        TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        printf("Layer %d, Neuron %d\n", layerIdx, neuronIdx);
+        printf(" M: %.8f V: %.8f\n", mlp->GetBiasM(layerIdx, neuronIdx), mlp->GetBiasV(layerIdx, neuronIdx));
+        if (weightIdx >= 0)
+            printf(" M_w[%d]: %.8f V_w[%d]: %.8f\n", weightIdx, mlp->GetWeightM(layerIdx, neuronIdx, weightIdx),
+                   weightIdx, mlp->GetWeightV(layerIdx, neuronIdx, weightIdx));
+        delete mlp;
+    }
     return 0;
 }
