@@ -51,6 +51,7 @@
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <curand_kernel.h>
+#include <iostream>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -60,12 +61,17 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
+#include <algorithm>
+
+using namespace std;
 
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
         if (err != cudaSuccess) { \
-            printf("CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " \
+                 << cudaGetErrorString(err) << endl; \
             exit(1); \
         } \
     } while(0)
@@ -74,14 +80,38 @@ const double EPSILON = 1e-15;
 const int BLOCK_SIZE = 256;
 const char MODEL_MAGIC[] = "MLPCUDA1";
 
-enum TActivationType { atSigmoid = 0, atTanh = 1, atReLU = 2, atSoftmax = 3 };
+// ========== Double atomicAdd for older GPUs ==========
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 600
+__device__ double atomicAddDouble(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#else
+__device__ double atomicAddDouble(double* address, double val) {
+    return atomicAdd(address, val);
+}
+#endif
+
+enum TActivationType { atSigmoid = 0, atTanh = 1, atReLU = 2, atSoftmax = 3, atLinear = 4 };
 enum TOptimizerType { otSGD = 0, otAdam = 1, otRMSProp = 2 };
+enum TLossType { ltMSE = 0, ltCrossEntropy = 1 };
 enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp };
 
+__device__ double d_clip(double v, double maxVal) {
+    if (v > maxVal) return maxVal;
+    else if (v < -maxVal) return -maxVal;
+    else return v;
+}
+
 __device__ double d_Sigmoid(double x) {
-    if (x < -500) return 0;
-    else if (x > 500) return 1;
-    else return 1.0 / (1.0 + exp(-x));
+    double clamped = fmax(-500.0, fmin(500.0, x));
+    return 1.0 / (1.0 + exp(-clamped));
 }
 
 __device__ double d_DSigmoid(double x) {
@@ -109,6 +139,7 @@ __device__ double d_ApplyActivation(double x, TActivationType ActType) {
         case atSigmoid: return d_Sigmoid(x);
         case atTanh: return d_TanhActivation(x);
         case atReLU: return d_ReLU(x);
+        case atLinear: return x;
         default: return d_Sigmoid(x);
     }
 }
@@ -118,6 +149,7 @@ __device__ double d_ApplyActivationDerivative(double x, TActivationType ActType)
         case atSigmoid: return d_DSigmoid(x);
         case atTanh: return d_DTanh(x);
         case atReLU: return d_DReLU(x);
+        case atLinear: return 1.0;
         default: return d_DSigmoid(x);
     }
 }
@@ -221,22 +253,24 @@ __global__ void BackPropHiddenKernel(LayerData layer, LayerData nextLayer) {
     }
 }
 
-__global__ void UpdateWeightsSGDKernel(LayerData layer, double* prevOutputs, double learningRate, double l2Lambda) {
+__global__ void UpdateWeightsSGDKernel(LayerData layer, double* prevOutputs, double learningRate, double l2Lambda, double clipVal) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < layer.NumNeurons) {
         for (int j = 0; j < layer.NumInputs; j++) {
             double gradient = layer.Errors[i] * prevOutputs[j];
             if (l2Lambda > 0)
                 gradient = gradient - l2Lambda * layer.Weights[i * layer.NumInputs + j];
+            gradient = d_clip(gradient, clipVal);
             layer.Weights[i * layer.NumInputs + j] += learningRate * gradient;
         }
-        layer.Biases[i] += learningRate * layer.Errors[i];
+        double biasGrad = d_clip(layer.Errors[i], clipVal);
+        layer.Biases[i] += learningRate * biasGrad;
     }
 }
 
 __global__ void UpdateWeightsAdamKernel(LayerData layer, double* prevOutputs, 
                                          double learningRate, double l2Lambda,
-                                         double beta1, double beta2, int timestep) {
+                                         double beta1, double beta2, int timestep, double clipVal) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < layer.NumNeurons) {
         double eps = 1e-8;
@@ -248,6 +282,7 @@ __global__ void UpdateWeightsAdamKernel(LayerData layer, double* prevOutputs,
             double gradient = -layer.Errors[i] * prevOutputs[j];
             if (l2Lambda > 0)
                 gradient += l2Lambda * layer.Weights[idx];
+            gradient = d_clip(gradient, clipVal);
 
             layer.M[idx] = beta1 * layer.M[idx] + (1 - beta1) * gradient;
             layer.V[idx] = beta2 * layer.V[idx] + (1 - beta2) * gradient * gradient;
@@ -258,7 +293,7 @@ __global__ void UpdateWeightsAdamKernel(LayerData layer, double* prevOutputs,
             layer.Weights[idx] -= learningRate * mHat / (sqrt(vHat) + eps);
         }
 
-        double gradient = -layer.Errors[i];
+        double gradient = d_clip(-layer.Errors[i], clipVal);
         layer.MBias[i] = beta1 * layer.MBias[i] + (1 - beta1) * gradient;
         layer.VBias[i] = beta2 * layer.VBias[i] + (1 - beta2) * gradient * gradient;
         double mHat = layer.MBias[i] / (1 - beta1_t);
@@ -268,7 +303,7 @@ __global__ void UpdateWeightsAdamKernel(LayerData layer, double* prevOutputs,
 }
 
 __global__ void UpdateWeightsRMSPropKernel(LayerData layer, double* prevOutputs,
-                                            double learningRate, double l2Lambda) {
+                                             double learningRate, double l2Lambda, double clipVal) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < layer.NumNeurons) {
         double eps = 1e-8;
@@ -279,12 +314,13 @@ __global__ void UpdateWeightsRMSPropKernel(LayerData layer, double* prevOutputs,
             double gradient = -layer.Errors[i] * prevOutputs[j];
             if (l2Lambda > 0)
                 gradient += l2Lambda * layer.Weights[idx];
+            gradient = d_clip(gradient, clipVal);
 
             layer.V[idx] = decay * layer.V[idx] + (1 - decay) * gradient * gradient;
             layer.Weights[idx] -= learningRate * gradient / (sqrt(layer.V[idx]) + eps);
         }
 
-        double gradient = -layer.Errors[i];
+        double gradient = d_clip(-layer.Errors[i], clipVal);
         layer.VBias[i] = decay * layer.VBias[i] + (1 - decay) * gradient * gradient;
         layer.Biases[i] -= learningRate * gradient / (sqrt(layer.VBias[i]) + eps);
     }
@@ -367,15 +403,17 @@ public:
     double L2Lambda;
     double Beta1;
     double Beta2;
+    double GradientClip;
     int Timestep;
     bool EnableLRDecay;
     double LRDecayRate;
     int LRDecayEpochs;
     bool EnableEarlyStopping;
     int EarlyStoppingPatience;
+    TLossType LossType;
 
     TMultiLayerPerceptronCUDA(int InputSize, const std::vector<int>& HiddenSizes, int OutputSize,
-                              TActivationType HiddenAct = atSigmoid, TActivationType OutputAct = atSigmoid) {
+                               TActivationType HiddenAct = atSigmoid, TActivationType OutputAct = atSigmoid) {
         LearningRate = 0.1;
         MaxIterations = 100;
         Optimizer = otSGD;
@@ -385,12 +423,14 @@ public:
         L2Lambda = 0;
         Beta1 = 0.9;
         Beta2 = 0.999;
+        GradientClip = 5.0;
         Timestep = 0;
         EnableLRDecay = false;
         LRDecayRate = 0.95;
         LRDecayEpochs = 10;
         EnableEarlyStopping = false;
         EarlyStoppingPatience = 10;
+        LossType = ltMSE;
         FIsTraining = true;
 
         FInputSize = InputSize;
@@ -505,14 +545,14 @@ public:
 
             switch (Optimizer) {
                 case otSGD:
-                    UpdateWeightsSGDKernel<<<blocks, BLOCK_SIZE>>>(layer, prevLayer.Outputs, LearningRate, L2Lambda);
+                    UpdateWeightsSGDKernel<<<blocks, BLOCK_SIZE>>>(layer, prevLayer.Outputs, LearningRate, L2Lambda, GradientClip);
                     break;
                 case otAdam:
                     UpdateWeightsAdamKernel<<<blocks, BLOCK_SIZE>>>(layer, prevLayer.Outputs, 
-                                                                     LearningRate, L2Lambda, Beta1, Beta2, Timestep);
+                                                                     LearningRate, L2Lambda, Beta1, Beta2, Timestep, GradientClip);
                     break;
                 case otRMSProp:
-                    UpdateWeightsRMSPropKernel<<<blocks, BLOCK_SIZE>>>(layer, prevLayer.Outputs, LearningRate, L2Lambda);
+                    UpdateWeightsRMSPropKernel<<<blocks, BLOCK_SIZE>>>(layer, prevLayer.Outputs, LearningRate, L2Lambda, GradientClip);
                     break;
             }
         }
@@ -602,12 +642,15 @@ public:
         fwrite(&L2Lambda, sizeof(double), 1, f);
         fwrite(&Beta1, sizeof(double), 1, f);
         fwrite(&Beta2, sizeof(double), 1, f);
+        fwrite(&GradientClip, sizeof(double), 1, f);
         fwrite(&Timestep, sizeof(int), 1, f);
         fwrite(&EnableLRDecay, sizeof(bool), 1, f);
         fwrite(&LRDecayRate, sizeof(double), 1, f);
         fwrite(&LRDecayEpochs, sizeof(int), 1, f);
         fwrite(&EnableEarlyStopping, sizeof(bool), 1, f);
         fwrite(&EarlyStoppingPatience, sizeof(int), 1, f);
+        int loss = (int)LossType;
+        fwrite(&loss, sizeof(int), 1, f);
 
         for (int k = 0; k < NumLayers; k++) {
             LayerData& layer = h_Layers[k];
@@ -683,12 +726,16 @@ public:
         fread(&mlp->L2Lambda, sizeof(double), 1, f);
         fread(&mlp->Beta1, sizeof(double), 1, f);
         fread(&mlp->Beta2, sizeof(double), 1, f);
+        fread(&mlp->GradientClip, sizeof(double), 1, f);
         fread(&mlp->Timestep, sizeof(int), 1, f);
         fread(&mlp->EnableLRDecay, sizeof(bool), 1, f);
         fread(&mlp->LRDecayRate, sizeof(double), 1, f);
         fread(&mlp->LRDecayEpochs, sizeof(int), 1, f);
         fread(&mlp->EnableEarlyStopping, sizeof(bool), 1, f);
         fread(&mlp->EarlyStoppingPatience, sizeof(int), 1, f);
+        int loss;
+        fread(&loss, sizeof(int), 1, f);
+        mlp->LossType = (TLossType)loss;
 
         for (int k = 0; k < mlp->NumLayers; k++) {
             LayerData& layer = mlp->h_Layers[k];
@@ -751,6 +798,7 @@ const char* ActivationToStr(TActivationType act) {
         case atTanh: return "tanh";
         case atReLU: return "relu";
         case atSoftmax: return "softmax";
+        case atLinear: return "linear";
     }
     return "sigmoid";
 }
@@ -768,6 +816,7 @@ TActivationType ParseActivation(const char* s) {
     if (strcasecmp(s, "tanh") == 0) return atTanh;
     if (strcasecmp(s, "relu") == 0) return atReLU;
     if (strcasecmp(s, "softmax") == 0) return atSoftmax;
+    if (strcasecmp(s, "linear") == 0) return atLinear;
     return atSigmoid;
 }
 
@@ -775,6 +824,11 @@ TOptimizerType ParseOptimizer(const char* s) {
     if (strcasecmp(s, "adam") == 0) return otAdam;
     if (strcasecmp(s, "rmsprop") == 0) return otRMSProp;
     return otSGD;
+}
+
+TLossType ParseLoss(const char* s) {
+    if (strcasecmp(s, "crossentropy") == 0) return ltCrossEntropy;
+    return ltMSE;
 }
 
 std::vector<int> ParseIntArray(const char* s) {
@@ -849,6 +903,8 @@ void NormalizeData(std::vector<DataPoint>& data) {
 
 void PrintUsage() {
     printf("MLP CUDA - Command-line Multi-Layer Perceptron\n");
+    printf("Matthew Abbott 2025");
+    printf("\n");
     printf("\n");
     printf("Commands:\n");
     printf("  create   Create a new MLP model\n");
@@ -864,12 +920,14 @@ void PrintUsage() {
     printf("  --save=FILE            Save model to file (required)\n");
     printf("  --lr=VALUE             Learning rate (default: 0.1)\n");
     printf("  --optimizer=TYPE       sgd|adam|rmsprop (default: sgd)\n");
-    printf("  --hidden-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
-    printf("  --output-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
+    printf("  --hidden-act=TYPE      sigmoid|tanh|relu|softmax|linear (default: sigmoid)\n");
+    printf("  --output-act=TYPE      sigmoid|tanh|relu|softmax|linear (default: sigmoid)\n");
     printf("  --dropout=VALUE        Dropout rate 0-1 (default: 0)\n");
     printf("  --l2=VALUE             L2 regularization (default: 0)\n");
     printf("  --beta1=VALUE          Adam beta1 (default: 0.9)\n");
     printf("  --beta2=VALUE          Adam beta2 (default: 0.999)\n");
+    printf("  --clip=VALUE           Gradient clipping value (default: 5.0)\n");
+    printf("  --loss=TYPE            mse|crossentropy (default: mse)\n");
     printf("\n");
     printf("Train Options:\n");
     printf("  --model=FILE           Model file to load (required)\n");
@@ -878,6 +936,7 @@ void PrintUsage() {
     printf("  --epochs=N             Number of training epochs (default: 100)\n");
     printf("  --batch=N              Batch size (default: 1)\n");
     printf("  --lr=VALUE             Override learning rate\n");
+    printf("  --clip=VALUE           Override gradient clipping\n");
     printf("  --lr-decay             Enable learning rate decay\n");
     printf("  --lr-decay-rate=VALUE  LR decay rate (default: 0.95)\n");
     printf("  --lr-decay-epochs=N    Epochs between decay (default: 10)\n");
@@ -931,14 +990,16 @@ int main(int argc, char** argv) {
     std::vector<double> inputValues;
     std::string modelFile, saveFile, dataFile;
     double learningRate = 0.1;
+    double gradientClip = 5.0;
     TOptimizerType optimizer = otSGD;
     TActivationType hiddenAct = atSigmoid, outputAct = atSigmoid;
+    TLossType lossType = ltMSE;
     double dropoutRate = 0, l2Lambda = 0, beta1 = 0.9, beta2 = 0.999;
     int epochs = 100, batchSize = 1;
     bool lrDecay = false, earlyStop = false, normalize = false, verbose = false;
     double lrDecayRate = 0.95;
     int lrDecayEpochs = 10, patience = 10;
-    bool lrOverride = false;
+    bool lrOverride = false, clipOverride = false;
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -969,6 +1030,8 @@ int main(int argc, char** argv) {
         else if (key == "--save") saveFile = value;
         else if (key == "--data") dataFile = value;
         else if (key == "--lr") { learningRate = atof(value.c_str()); lrOverride = true; }
+        else if (key == "--clip") { gradientClip = atof(value.c_str()); clipOverride = true; }
+        else if (key == "--loss") lossType = ParseLoss(value.c_str());
         else if (key == "--optimizer") optimizer = ParseOptimizer(value.c_str());
         else if (key == "--hidden-act") hiddenAct = ParseActivation(value.c_str());
         else if (key == "--output-act") outputAct = ParseActivation(value.c_str());
@@ -1008,6 +1071,8 @@ int main(int argc, char** argv) {
         mlp->L2Lambda = l2Lambda;
         mlp->Beta1 = beta1;
         mlp->Beta2 = beta2;
+        mlp->GradientClip = gradientClip;
+        mlp->LossType = lossType;
 
         mlp->Save(saveFile.c_str());
 
@@ -1022,6 +1087,7 @@ int main(int argc, char** argv) {
         printf("  Output activation: %s\n", ActivationToStr(outputAct));
         printf("  Optimizer: %s\n", OptimizerToStr(optimizer));
         printf("  Learning rate: %.4f\n", learningRate);
+        printf("  Gradient clipping: %.4f\n", gradientClip);
         printf("  Saved to: %s\n", saveFile.c_str());
 
         delete mlp;
@@ -1035,6 +1101,7 @@ int main(int argc, char** argv) {
         if (!mlp) { printf("Error: Failed to load model: %s\n", modelFile.c_str()); return 1; }
 
         if (lrOverride) mlp->LearningRate = learningRate;
+        if (clipOverride) mlp->GradientClip = gradientClip;
         mlp->EnableLRDecay = lrDecay;
         mlp->LRDecayRate = lrDecayRate;
         mlp->LRDecayEpochs = lrDecayEpochs;
@@ -1144,6 +1211,8 @@ int main(int argc, char** argv) {
         printf("  L2 lambda: %.6f\n", mlp->L2Lambda);
         printf("  Beta1: %.4f\n", mlp->Beta1);
         printf("  Beta2: %.4f\n", mlp->Beta2);
+        printf("  Gradient clipping: %.6f\n", mlp->GradientClip);
+        printf("  Loss type: %s\n", mlp->LossType == ltMSE ? "mse" : "crossentropy");
         printf("  Timestep: %d\n", mlp->Timestep);
         printf("\n");
         printf("Total layers: %d\n", mlp->GetNumLayers());
