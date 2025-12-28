@@ -8,6 +8,64 @@
 // Compile:
 //   g++ -o facaded_mlp_opencl facaded_mlp_opencl.cpp -lOpenCL -std=c++11
 //
+// Usage (commands):
+//   facaded_mlp_opencl create --input=N --hidden=N,N,... --output=N [options] --save=FILE
+//   facaded_mlp_opencl train --model=FILE --data=FILE [options] --save=FILE
+//   facaded_mlp_opencl predict --model=FILE --input=v1,v2,...
+//   facaded_mlp_opencl info --model=FILE
+//   facaded_mlp_opencl get-weight --model=FILE --layer=L --neuron=N --weight=W
+//   facaded_mlp_opencl set-weight --model=FILE --layer=L --neuron=N --weight=W --value=V --save=FILE
+//   facaded_mlp_opencl get-weights --model=FILE --layer=L --neuron=N
+//   facaded_mlp_opencl get-bias --model=FILE --layer=L --neuron=N
+//   facaded_mlp_opencl set-bias --model=FILE --layer=L --neuron=N --value=V --save=FILE
+//   facaded_mlp_opencl get-output --model=FILE --layer=L --neuron=N [--input=v1,v2,...]
+//   facaded_mlp_opencl get-error --model=FILE --layer=L --neuron=N
+//   facaded_mlp_opencl layer-info --model=FILE --layer=L
+//   facaded_mlp_opencl histogram --model=FILE --layer=L [--bins=N] [--type=activation|error]
+//   facaded_mlp_opencl get-optimizer --model=FILE --layer=L --neuron=N [--weight=W]
+//   facaded_mlp_opencl help
+//
+// Standard Options:
+//   --input=N                  Input layer size (create) or input values (predict/get-output)
+//   --hidden=N,N,...           Hidden layer sizes (comma-separated, required for create)
+//   --output=N                 Output layer size (required for create)
+//   --save=FILE                Save model to file (required for create/train/set-*)
+//   --model=FILE               Model file to load
+//   --data=FILE                Training data CSV file
+//   --lr=VALUE                 Learning rate (default: 0.1)
+//   --optimizer=TYPE           sgd|adam|rmsprop (default: sgd)
+//   --hidden-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
+//   --output-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
+//   --dropout=VALUE            Dropout rate 0-1 (default: 0)
+//   --l2=VALUE                 L2 regularization (default: 0)
+//   --beta1=VALUE              Adam beta1 (default: 0.9)
+//   --beta2=VALUE              Adam beta2 (default: 0.999)
+//   --epochs=N                 Training epochs (default: 100)
+//   --batch=N                  Training batch size (default: 1)
+//   --lr-decay                 Enable learning rate decay
+//   --lr-decay-rate=VALUE      Learning rate decay rate (default: 0.95)
+//   --lr-decay-epochs=N        Iterations between learning rate decay (default: 10)
+//   --early-stop               Enable early stopping
+//   --patience=N               Early stopping patience (default: 10)
+//   --normalize                Normalize input data before training
+//   --verbose                  Show training progress
+//
+// Facade Options:
+//   --layer=L                  Layer index for facade commands
+//   --neuron=N                 Neuron index for facade commands
+//   --weight=W                 Weight index for facade commands (within neuron)
+//   --value=V                  Value for set-* commands
+//   --bins=N                   Number of histogram bins (default: 20)
+//   --type=TYPE                Histogram type: activation|error (default: activation)
+//
+// Examples:
+//   facaded_mlp_opencl create --input=2 --hidden=8 --output=1 --save=xor.bin
+//   facaded_mlp_opencl train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin
+//   facaded_mlp_opencl predict --model=xor_trained.bin --input=1,0
+//   facaded_mlp_opencl info --model=xor_trained.bin
+//   facaded_mlp_opencl get-weight --model=xor.bin --layer=0 --neuron=0 --weight=0
+//   facaded_mlp_opencl set-weight --model=xor.bin --layer=0 --neuron=0 --weight=0 --value=0.5 --save=xor_mod.bin
+//
 
 #define CL_TARGET_OPENCL_VERSION 120
 #ifdef __APPLE__
@@ -1253,27 +1311,86 @@ void NormalizeData(std::vector<DataPoint>& data) {
 }
 
 void PrintUsage() {
-    printf("Facaded MLP OpenCL - Command-line Multi-Layer Perceptron (w/ Facade)\n\n");
-    printf("Commands:\n"
-        "  create      Create a new model\n"
-        "  train       Train model with data\n"
-        "  predict     Predict output\n"
-        "  info        Print model info\n"
-        "  get-weight  Get a weight value\n"
-        "  set-weight  Set a weight value\n"
-        "  get-weights Get all weights\n"
-        "  get-bias    Get bias value\n"
-        "  set-bias    Set bias value\n"
-        "  get-output  Get neuron output\n"
-        "  get-error   Get error\n"
-        "  layer-info  Print layer info\n"
-        "  histogram   Print activation histogram\n"
-        "  get-optimizer Print optimizer value\n"
-        "  help        Print usage\n");
+    printf("Facaded MLP OpenCL - Command-line Multi-Layer Perceptron (w/ Facade)\n");
+    printf("Matthew Abbott 2025\n");
+    printf("\n");
+    printf("Commands:\n");
+    printf("  create         Create a new MLP model\n");
+    printf("  train          Train an existing model with data\n");
+    printf("  predict        Make predictions with a trained model\n");
+    printf("  info           Display model information\n");
+    printf("  get-weight     Get a single weight value\n");
+    printf("  set-weight     Set a single weight value\n");
+    printf("  get-weights    Get all weights for a neuron\n");
+    printf("  get-bias       Get bias value for a neuron\n");
+    printf("  set-bias       Set bias value for a neuron\n");
+    printf("  get-output     Get neuron output value\n");
+    printf("  get-error      Get neuron error value\n");
+    printf("  layer-info     Display layer information\n");
+    printf("  histogram      Display activation or error histogram\n");
+    printf("  get-optimizer  Get optimizer state values (M, V for Adam/RMSProp)\n");
+    printf("  help           Show this help message\n");
+    printf("\n");
+    printf("Create Options:\n");
+    printf("  --input=N              Input layer size (required)\n");
+    printf("  --hidden=N,N,...       Hidden layer sizes (required)\n");
+    printf("  --output=N             Output layer size (required)\n");
+    printf("  --save=FILE            Save model to file (required)\n");
+    printf("  --lr=VALUE             Learning rate (default: 0.1)\n");
+    printf("  --optimizer=TYPE       sgd|adam|rmsprop (default: sgd)\n");
+    printf("  --hidden-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
+    printf("  --output-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
+    printf("  --dropout=VALUE        Dropout rate 0-1 (default: 0)\n");
+    printf("  --l2=VALUE             L2 regularization (default: 0)\n");
+    printf("  --beta1=VALUE          Adam beta1 (default: 0.9)\n");
+    printf("  --beta2=VALUE          Adam beta2 (default: 0.999)\n");
+    printf("\n");
+    printf("Train Options:\n");
+    printf("  --model=FILE           Model file to load (required)\n");
+    printf("  --data=FILE            Training data CSV file (required)\n");
+    printf("  --save=FILE            Save trained model to file (required)\n");
+    printf("  --epochs=N             Number of training epochs (default: 100)\n");
+    printf("  --batch=N              Batch size (default: 1)\n");
+    printf("  --lr=VALUE             Override learning rate\n");
+    printf("  --lr-decay             Enable learning rate decay\n");
+    printf("  --lr-decay-rate=VALUE  LR decay rate (default: 0.95)\n");
+    printf("  --lr-decay-epochs=N    Epochs between decay (default: 10)\n");
+    printf("  --early-stop           Enable early stopping\n");
+    printf("  --patience=N           Early stopping patience (default: 10)\n");
+    printf("  --normalize            Normalize input data\n");
+    printf("  --verbose              Show training progress\n");
+    printf("\n");
+    printf("Predict Options:\n");
+    printf("  --model=FILE           Model file to load (required)\n");
+    printf("  --input=v1,v2,...      Input values (required)\n");
+    printf("\n");
+    printf("Info Options:\n");
+    printf("  --model=FILE           Model file to load (required)\n");
+    printf("\n");
+    printf("Facade Options:\n");
+    printf("  --layer=L              Layer index (required for facade commands)\n");
+    printf("  --neuron=N             Neuron index (required for most facade commands)\n");
+    printf("  --weight=W             Weight index within neuron (for weight commands)\n");
+    printf("  --value=V              Value to set (required for set-* commands)\n");
+    printf("  --bins=N               Number of histogram bins (default: 20)\n");
+    printf("  --type=TYPE            Histogram type: activation or error (default: activation)\n");
+    printf("  --input=v1,v2,...      Input values for get-output (optional)\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  facaded_mlp_opencl create --input=2 --hidden=8 --output=1 --save=xor.bin\n");
+    printf("  facaded_mlp_opencl train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin\n");
+    printf("  facaded_mlp_opencl predict --model=xor_trained.bin --input=1,0\n");
+    printf("  facaded_mlp_opencl info --model=xor_trained.bin\n");
+    printf("  facaded_mlp_opencl get-weight --model=xor.bin --layer=0 --neuron=0 --weight=0\n");
+    printf("  facaded_mlp_opencl set-weight --model=xor.bin --layer=0 --neuron=0 --weight=0 --value=0.5 --save=xor_mod.bin\n");
+    printf("  facaded_mlp_opencl layer-info --model=xor.bin --layer=0\n");
+    printf("  facaded_mlp_opencl histogram --model=xor.bin --layer=1 --bins=30 --type=activation\n");
 }
 
 int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
+    
+    // Show help if no arguments provided or if --help is the first argument
     if (argc < 2) {
         PrintUsage();
         return 0;
