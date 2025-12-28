@@ -38,7 +38,7 @@
 
 const double EPSILON = 1e-15;
 const int BLOCK_SIZE = 256;
-const char MODEL_MAGIC[] = "FACMLPO1";
+const char MODEL_MAGIC[] = "MLPOCL01";
 
 // -------- Activation and Optimizer types --------
 enum TActivationType { atSigmoid = 0, atTanh = 1, atReLU = 2, atSoftmax = 3 };
@@ -58,11 +58,26 @@ float d_Sigmoid(float x) {
     else if (x > 500.0f) return 1.0f;
     else return 1.0f / (1.0f + exp(-x));
 }
-float d_DSigmoid(float x) { return x * (1.0f - x); }
-float d_TanhActivation(float x) { return tanh(x); }
-float d_DTanh(float x) { return 1.0f - (x * x); }
-float d_ReLU(float x) { return (x > 0.0f) ? x : 0.0f; }
-float d_DReLU(float x) { return (x > 0.0f) ? 1.0f : 0.0f; }
+
+float d_DSigmoid(float x) {
+    return x * (1.0f - x);
+}
+
+float d_TanhActivation(float x) {
+    return tanh(x);
+}
+
+float d_DTanh(float x) {
+    return 1.0f - (x * x);
+}
+
+float d_ReLU(float x) {
+    return (x > 0.0f) ? x : 0.0f;
+}
+
+float d_DReLU(float x) {
+    return (x > 0.0f) ? 1.0f : 0.0f;
+}
 
 float d_ApplyActivation(float x, int ActType) {
     if (ActType == 0) return d_Sigmoid(x);
@@ -127,14 +142,16 @@ __kernel void SoftmaxKernel(__global float* sums,
     }
 }
 
-// Simple OpenCL device random for dropout (not cryptographically secure)
+// Simple LCG random number generator for dropout
 unsigned int lcg_rand(unsigned int seed) {
     return seed * 1103515245u + 12345u;
 }
+
 float lcg_uniform(unsigned int* seed) {
     *seed = lcg_rand(*seed);
     return ((float)(*seed)) / 4294967296.0f;
 }
+
 __kernel void ApplyDropoutKernel(__global float* outputs,
                                   __global uchar* dropoutMask,
                                   int numNeurons,
@@ -294,6 +311,7 @@ __kernel void UpdateWeightsRMSPropKernel(__global float* weights,
         biases[i] -= learningRate * gradient / (sqrt(VBias[i]) + eps);
     }
 }
+
 )CLC";
 
 // -------- LayerData structure --------
@@ -306,7 +324,7 @@ struct LayerData {
     cl_mem V;
     cl_mem MBias;
     cl_mem VBias;
-    cl_mem DropoutMask; // uchar
+    cl_mem DropoutMask;
     int NumNeurons;
     int NumInputs;
     TActivationType ActivationType;
@@ -337,8 +355,8 @@ private:
     bool FIsTraining;
     int MaxNeurons;
 
-    cl_mem d_Target; // float
-    cl_mem d_SoftmaxSums; // float
+    cl_mem d_Target;
+    cl_mem d_SoftmaxSums;
 
     void InitOpenCL() {
         cl_int err;
@@ -392,7 +410,6 @@ private:
         CL_CHECK(err);
     }
 
-        // -------- Layer allocator --------
     void AllocateLayer(LayerData& layer, int numNeurons, int numInputs, TActivationType actType) {
         cl_int err;
         layer.NumNeurons = numNeurons;
@@ -400,36 +417,42 @@ private:
         layer.ActivationType = actType;
         int weightSize = numNeurons * numInputs;
 
-        layer.Weights = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.Biases  = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.Outputs = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.Errors  = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.M       = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.V       = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.MBias   = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.VBias   = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err); CL_CHECK(err);
-        layer.DropoutMask = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(unsigned char), NULL, &err); CL_CHECK(err);
+        layer.Weights = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.Biases = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.Outputs = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.Errors = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.M = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.V = clCreateBuffer(context, CL_MEM_READ_WRITE, weightSize * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.MBias = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.VBias = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        layer.DropoutMask = clCreateBuffer(context, CL_MEM_READ_WRITE, numNeurons * sizeof(unsigned char), NULL, &err);
+        CL_CHECK(err);
 
-        // Zero some buffers
         float* zeros = new float[std::max(weightSize, numNeurons)]();
         clEnqueueWriteBuffer(queue, layer.Biases, CL_TRUE, 0, numNeurons * sizeof(float), zeros, 0, NULL, NULL);
         clEnqueueWriteBuffer(queue, layer.M, CL_TRUE, 0, weightSize * sizeof(float), zeros, 0, NULL, NULL);
         clEnqueueWriteBuffer(queue, layer.V, CL_TRUE, 0, weightSize * sizeof(float), zeros, 0, NULL, NULL);
         clEnqueueWriteBuffer(queue, layer.MBias, CL_TRUE, 0, numNeurons * sizeof(float), zeros, 0, NULL, NULL);
         clEnqueueWriteBuffer(queue, layer.VBias, CL_TRUE, 0, numNeurons * sizeof(float), zeros, 0, NULL, NULL);
-
         delete[] zeros;
 
-        // Xavier/He initialization
         float limit;
         if (actType == atReLU)
-            limit = sqrtf(2.0f / numInputs);
+            limit = sqrt(2.0 / numInputs);
         else
-            limit = sqrtf(6.0f / (numInputs + numNeurons));
+            limit = sqrt(6.0 / (numInputs + numNeurons));
 
         float* h_weights = new float[weightSize];
         for (int i = 0; i < weightSize; i++)
-            h_weights[i] = ((float)rand() / RAND_MAX * 2.0f - 1.0f) * limit;
+            h_weights[i] = ((float)rand() / RAND_MAX * 2 - 1) * limit;
         clEnqueueWriteBuffer(queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(float), h_weights, 0, NULL, NULL);
         delete[] h_weights;
 
@@ -449,6 +472,203 @@ private:
         if (layer.MBias) clReleaseMemObject(layer.MBias);
         if (layer.VBias) clReleaseMemObject(layer.VBias);
         if (layer.DropoutMask) clReleaseMemObject(layer.DropoutMask);
+    }
+
+    void FeedForward() {
+        cl_int err;
+
+        for (int k = 1; k < NumLayers - 1; k++) {
+            LayerData& layer = Layers[k];
+            LayerData& prevLayer = Layers[k - 1];
+
+            size_t globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+
+            clSetKernelArg(feedForwardKernel, 0, sizeof(cl_mem), &layer.Weights);
+            clSetKernelArg(feedForwardKernel, 1, sizeof(cl_mem), &layer.Biases);
+            clSetKernelArg(feedForwardKernel, 2, sizeof(cl_mem), &layer.Outputs);
+            clSetKernelArg(feedForwardKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
+            clSetKernelArg(feedForwardKernel, 4, sizeof(int), &layer.NumNeurons);
+            clSetKernelArg(feedForwardKernel, 5, sizeof(int), &layer.NumInputs);
+            clSetKernelArg(feedForwardKernel, 6, sizeof(int), &prevLayer.NumNeurons);
+            int actType = (int)layer.ActivationType;
+            clSetKernelArg(feedForwardKernel, 7, sizeof(int), &actType);
+
+            err = clEnqueueNDRangeKernel(queue, feedForwardKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+            CL_CHECK(err);
+
+            if (FIsTraining && DropoutRate > 0) {
+                float scale = 1.0 / (1.0 - DropoutRate);
+                unsigned int seed = (unsigned int)(time(NULL) + k);
+
+                clSetKernelArg(applyDropoutKernel, 0, sizeof(cl_mem), &layer.Outputs);
+                clSetKernelArg(applyDropoutKernel, 1, sizeof(cl_mem), &layer.DropoutMask);
+                clSetKernelArg(applyDropoutKernel, 2, sizeof(int), &layer.NumNeurons);
+                clSetKernelArg(applyDropoutKernel, 3, sizeof(float), &DropoutRate);
+                clSetKernelArg(applyDropoutKernel, 4, sizeof(float), &scale);
+                clSetKernelArg(applyDropoutKernel, 5, sizeof(unsigned int), &seed);
+
+                err = clEnqueueNDRangeKernel(queue, applyDropoutKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+                CL_CHECK(err);
+            }
+        }
+
+        LayerData& outputLayer = Layers[NumLayers - 1];
+        LayerData& lastHidden = Layers[NumLayers - 2];
+        size_t globalSize = ((outputLayer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+
+        if (OutputActivation == atSoftmax) {
+            clSetKernelArg(feedForwardSoftmaxSumKernel, 0, sizeof(cl_mem), &outputLayer.Weights);
+            clSetKernelArg(feedForwardSoftmaxSumKernel, 1, sizeof(cl_mem), &outputLayer.Biases);
+            clSetKernelArg(feedForwardSoftmaxSumKernel, 2, sizeof(cl_mem), &d_SoftmaxSums);
+            clSetKernelArg(feedForwardSoftmaxSumKernel, 3, sizeof(cl_mem), &lastHidden.Outputs);
+            clSetKernelArg(feedForwardSoftmaxSumKernel, 4, sizeof(int), &outputLayer.NumNeurons);
+            clSetKernelArg(feedForwardSoftmaxSumKernel, 5, sizeof(int), &outputLayer.NumInputs);
+            clSetKernelArg(feedForwardSoftmaxSumKernel, 6, sizeof(int), &lastHidden.NumNeurons);
+
+            err = clEnqueueNDRangeKernel(queue, feedForwardSoftmaxSumKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+            CL_CHECK(err);
+            clFinish(queue);
+
+            float* h_sums = new float[outputLayer.NumNeurons];
+            clEnqueueReadBuffer(queue, d_SoftmaxSums, CL_TRUE, 0, outputLayer.NumNeurons * sizeof(float), h_sums, 0, NULL, NULL);
+
+            float maxVal = h_sums[0];
+            for (int i = 1; i < outputLayer.NumNeurons; i++)
+                if (h_sums[i] > maxVal) maxVal = h_sums[i];
+
+            float sumExp = 0;
+            for (int i = 0; i < outputLayer.NumNeurons; i++)
+                sumExp += exp(h_sums[i] - maxVal);
+
+            delete[] h_sums;
+
+            clSetKernelArg(softmaxKernel, 0, sizeof(cl_mem), &d_SoftmaxSums);
+            clSetKernelArg(softmaxKernel, 1, sizeof(cl_mem), &outputLayer.Outputs);
+            clSetKernelArg(softmaxKernel, 2, sizeof(int), &outputLayer.NumNeurons);
+            clSetKernelArg(softmaxKernel, 3, sizeof(float), &maxVal);
+            clSetKernelArg(softmaxKernel, 4, sizeof(float), &sumExp);
+
+            err = clEnqueueNDRangeKernel(queue, softmaxKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+            CL_CHECK(err);
+        } else {
+            clSetKernelArg(feedForwardKernel, 0, sizeof(cl_mem), &outputLayer.Weights);
+            clSetKernelArg(feedForwardKernel, 1, sizeof(cl_mem), &outputLayer.Biases);
+            clSetKernelArg(feedForwardKernel, 2, sizeof(cl_mem), &outputLayer.Outputs);
+            clSetKernelArg(feedForwardKernel, 3, sizeof(cl_mem), &lastHidden.Outputs);
+            clSetKernelArg(feedForwardKernel, 4, sizeof(int), &outputLayer.NumNeurons);
+            clSetKernelArg(feedForwardKernel, 5, sizeof(int), &outputLayer.NumInputs);
+            clSetKernelArg(feedForwardKernel, 6, sizeof(int), &lastHidden.NumNeurons);
+            int actType = (int)outputLayer.ActivationType;
+            clSetKernelArg(feedForwardKernel, 7, sizeof(int), &actType);
+
+            err = clEnqueueNDRangeKernel(queue, feedForwardKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+            CL_CHECK(err);
+        }
+        clFinish(queue);
+    }
+
+    void BackPropagate() {
+        cl_int err;
+        LayerData& outputLayer = Layers[NumLayers - 1];
+        size_t globalSize = ((outputLayer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+
+        int isSoftmax = (OutputActivation == atSoftmax) ? 1 : 0;
+        int actType = (int)outputLayer.ActivationType;
+
+        clSetKernelArg(backPropOutputKernel, 0, sizeof(cl_mem), &outputLayer.Errors);
+        clSetKernelArg(backPropOutputKernel, 1, sizeof(cl_mem), &outputLayer.Outputs);
+        clSetKernelArg(backPropOutputKernel, 2, sizeof(cl_mem), &d_Target);
+        clSetKernelArg(backPropOutputKernel, 3, sizeof(int), &outputLayer.NumNeurons);
+        clSetKernelArg(backPropOutputKernel, 4, sizeof(int), &actType);
+        clSetKernelArg(backPropOutputKernel, 5, sizeof(int), &isSoftmax);
+
+        err = clEnqueueNDRangeKernel(queue, backPropOutputKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+        CL_CHECK(err);
+        clFinish(queue);
+
+        for (int k = NumLayers - 2; k >= 1; k--) {
+            LayerData& layer = Layers[k];
+            LayerData& nextLayer = Layers[k + 1];
+            globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+
+            actType = (int)layer.ActivationType;
+
+            clSetKernelArg(backPropHiddenKernel, 0, sizeof(cl_mem), &layer.Errors);
+            clSetKernelArg(backPropHiddenKernel, 1, sizeof(cl_mem), &layer.Outputs);
+            clSetKernelArg(backPropHiddenKernel, 2, sizeof(cl_mem), &layer.DropoutMask);
+            clSetKernelArg(backPropHiddenKernel, 3, sizeof(cl_mem), &nextLayer.Errors);
+            clSetKernelArg(backPropHiddenKernel, 4, sizeof(cl_mem), &nextLayer.Weights);
+            clSetKernelArg(backPropHiddenKernel, 5, sizeof(int), &layer.NumNeurons);
+            clSetKernelArg(backPropHiddenKernel, 6, sizeof(int), &actType);
+            clSetKernelArg(backPropHiddenKernel, 7, sizeof(int), &nextLayer.NumNeurons);
+            clSetKernelArg(backPropHiddenKernel, 8, sizeof(int), &nextLayer.NumInputs);
+
+            err = clEnqueueNDRangeKernel(queue, backPropHiddenKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+            CL_CHECK(err);
+            clFinish(queue);
+        }
+    }
+
+    void UpdateWeights() {
+        cl_int err;
+        Timestep++;
+
+        for (int k = NumLayers - 1; k >= 1; k--) {
+            LayerData& layer = Layers[k];
+            LayerData& prevLayer = Layers[k - 1];
+            size_t globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+
+            switch (Optimizer) {
+                case otSGD:
+                    clSetKernelArg(updateWeightsSGDKernel, 0, sizeof(cl_mem), &layer.Weights);
+                    clSetKernelArg(updateWeightsSGDKernel, 1, sizeof(cl_mem), &layer.Biases);
+                    clSetKernelArg(updateWeightsSGDKernel, 2, sizeof(cl_mem), &layer.Errors);
+                    clSetKernelArg(updateWeightsSGDKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
+                    clSetKernelArg(updateWeightsSGDKernel, 4, sizeof(int), &layer.NumNeurons);
+                    clSetKernelArg(updateWeightsSGDKernel, 5, sizeof(int), &layer.NumInputs);
+                    clSetKernelArg(updateWeightsSGDKernel, 6, sizeof(float), &LearningRate);
+                    clSetKernelArg(updateWeightsSGDKernel, 7, sizeof(float), &L2Lambda);
+                    err = clEnqueueNDRangeKernel(queue, updateWeightsSGDKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+                    CL_CHECK(err);
+                    break;
+
+                case otAdam:
+                    clSetKernelArg(updateWeightsAdamKernel, 0, sizeof(cl_mem), &layer.Weights);
+                    clSetKernelArg(updateWeightsAdamKernel, 1, sizeof(cl_mem), &layer.Biases);
+                    clSetKernelArg(updateWeightsAdamKernel, 2, sizeof(cl_mem), &layer.Errors);
+                    clSetKernelArg(updateWeightsAdamKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
+                    clSetKernelArg(updateWeightsAdamKernel, 4, sizeof(cl_mem), &layer.M);
+                    clSetKernelArg(updateWeightsAdamKernel, 5, sizeof(cl_mem), &layer.V);
+                    clSetKernelArg(updateWeightsAdamKernel, 6, sizeof(cl_mem), &layer.MBias);
+                    clSetKernelArg(updateWeightsAdamKernel, 7, sizeof(cl_mem), &layer.VBias);
+                    clSetKernelArg(updateWeightsAdamKernel, 8, sizeof(int), &layer.NumNeurons);
+                    clSetKernelArg(updateWeightsAdamKernel, 9, sizeof(int), &layer.NumInputs);
+                    clSetKernelArg(updateWeightsAdamKernel, 10, sizeof(float), &LearningRate);
+                    clSetKernelArg(updateWeightsAdamKernel, 11, sizeof(float), &L2Lambda);
+                    clSetKernelArg(updateWeightsAdamKernel, 12, sizeof(float), &Beta1);
+                    clSetKernelArg(updateWeightsAdamKernel, 13, sizeof(float), &Beta2);
+                    clSetKernelArg(updateWeightsAdamKernel, 14, sizeof(int), &Timestep);
+                    err = clEnqueueNDRangeKernel(queue, updateWeightsAdamKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+                    CL_CHECK(err);
+                    break;
+
+                case otRMSProp:
+                    clSetKernelArg(updateWeightsRMSPropKernel, 0, sizeof(cl_mem), &layer.Weights);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 1, sizeof(cl_mem), &layer.Biases);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 2, sizeof(cl_mem), &layer.Errors);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 4, sizeof(cl_mem), &layer.V);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 5, sizeof(cl_mem), &layer.VBias);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 6, sizeof(int), &layer.NumNeurons);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 7, sizeof(int), &layer.NumInputs);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 8, sizeof(float), &LearningRate);
+                    clSetKernelArg(updateWeightsRMSPropKernel, 9, sizeof(float), &L2Lambda);
+                    err = clEnqueueNDRangeKernel(queue, updateWeightsRMSPropKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL);
+                    CL_CHECK(err);
+                    break;
+            }
+        }
+        clFinish(queue);
     }
 
 public:
@@ -498,6 +718,7 @@ public:
         NumLayers = HiddenSizes.size() + 2;
         Layers = new LayerData[NumLayers];
         memset(Layers, 0, NumLayers * sizeof(LayerData));
+
         AllocateLayer(Layers[0], InputSize + 1, InputSize, atSigmoid);
 
         MaxNeurons = InputSize + 1;
@@ -507,20 +728,25 @@ public:
             if (HiddenSizes[i] + 1 > MaxNeurons) MaxNeurons = HiddenSizes[i] + 1;
             numInputs = HiddenSizes[i];
         }
+
         AllocateLayer(Layers[NumLayers - 1], OutputSize, numInputs + 1, OutputActivation);
         if (OutputSize > MaxNeurons) MaxNeurons = OutputSize;
 
         cl_int err;
-        d_Target = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err); CL_CHECK(err);
-        d_SoftmaxSums = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err); CL_CHECK(err);
+        d_Target = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
+        CL_CHECK(err);
+        d_SoftmaxSums = clCreateBuffer(context, CL_MEM_READ_WRITE, OutputSize * sizeof(float), NULL, &err);
+        CL_CHECK(err);
     }
 
     ~TMultiLayerPerceptronOpenCLFacaded() {
         for (int i = 0; i < NumLayers; i++)
             FreeLayer(Layers[i]);
         delete[] Layers;
+
         clReleaseMemObject(d_Target);
         clReleaseMemObject(d_SoftmaxSums);
+
         clReleaseKernel(feedForwardKernel);
         clReleaseKernel(feedForwardSoftmaxSumKernel);
         clReleaseKernel(softmaxKernel);
@@ -530,185 +756,197 @@ public:
         clReleaseKernel(updateWeightsSGDKernel);
         clReleaseKernel(updateWeightsAdamKernel);
         clReleaseKernel(updateWeightsRMSPropKernel);
+
         clReleaseProgram(program);
         clReleaseCommandQueue(queue);
         clReleaseContext(context);
     }
 
-    // -------- Feedforward --------
-    void FeedForward() {
-        cl_int err;
-        for (int k = 1; k < NumLayers - 1; k++) {
-            LayerData& layer = Layers[k];
-            LayerData& prevLayer = Layers[k - 1];
-            size_t globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            clSetKernelArg(feedForwardKernel, 0, sizeof(cl_mem), &layer.Weights);
-            clSetKernelArg(feedForwardKernel, 1, sizeof(cl_mem), &layer.Biases);
-            clSetKernelArg(feedForwardKernel, 2, sizeof(cl_mem), &layer.Outputs);
-            clSetKernelArg(feedForwardKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
-            clSetKernelArg(feedForwardKernel, 4, sizeof(int), &layer.NumNeurons);
-            clSetKernelArg(feedForwardKernel, 5, sizeof(int), &layer.NumInputs);
-            clSetKernelArg(feedForwardKernel, 6, sizeof(int), &prevLayer.NumNeurons);
-            int actType = (int)layer.ActivationType;
-            clSetKernelArg(feedForwardKernel, 7, sizeof(int), &actType);
-            err = clEnqueueNDRangeKernel(queue, feedForwardKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
+    void Predict(const double* Input, double* Result) {
+        FIsTraining = false;
 
-            if (FIsTraining && DropoutRate > 0) {
-                float scale = 1.0f / (1.0f - DropoutRate);
-                unsigned int seed = (unsigned int)(time(NULL) + k);
-                clSetKernelArg(applyDropoutKernel, 0, sizeof(cl_mem), &layer.Outputs);
-                clSetKernelArg(applyDropoutKernel, 1, sizeof(cl_mem), &layer.DropoutMask);
-                clSetKernelArg(applyDropoutKernel, 2, sizeof(int), &layer.NumNeurons);
-                clSetKernelArg(applyDropoutKernel, 3, sizeof(float), &DropoutRate);
-                clSetKernelArg(applyDropoutKernel, 4, sizeof(float), &scale);
-                clSetKernelArg(applyDropoutKernel, 5, sizeof(unsigned int), &seed);
-                err = clEnqueueNDRangeKernel(queue, applyDropoutKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-            }
-        }
+        float* h_input = new float[FInputSize + 1];
+        for (int i = 0; i < FInputSize; i++) h_input[i] = (float)Input[i];
+        h_input[FInputSize] = 1.0f;
+        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
+        delete[] h_input;
 
-        LayerData& outputLayer = Layers[NumLayers - 1];
-        LayerData& lastHidden = Layers[NumLayers - 2];
-        size_t globalSize = ((outputLayer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+        FeedForward();
+
+        float* h_output = new float[FOutputSize];
+        clEnqueueReadBuffer(queue, Layers[NumLayers - 1].Outputs, CL_TRUE, 0, FOutputSize * sizeof(float), h_output, 0, NULL, NULL);
+        for (int i = 0; i < FOutputSize; i++) Result[i] = (double)h_output[i];
+        delete[] h_output;
+
+        FIsTraining = true;
+    }
+
+    void Train(const double* Input, const double* Target) {
+        FIsTraining = true;
+
+        float* h_input = new float[FInputSize + 1];
+        for (int i = 0; i < FInputSize; i++) h_input[i] = (float)Input[i];
+        h_input[FInputSize] = 1.0f;
+        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
+        delete[] h_input;
+
+        float* h_target = new float[FOutputSize];
+        for (int i = 0; i < FOutputSize; i++) h_target[i] = (float)Target[i];
+        clEnqueueWriteBuffer(queue, d_Target, CL_TRUE, 0, FOutputSize * sizeof(float), h_target, 0, NULL, NULL);
+        delete[] h_target;
+
+        FeedForward();
+        BackPropagate();
+        UpdateWeights();
+    }
+
+    double ComputeLoss(const double* Predicted, const double* Target) {
+        double Result = 0;
+
         if (OutputActivation == atSoftmax) {
-            clSetKernelArg(feedForwardSoftmaxSumKernel, 0, sizeof(cl_mem), &outputLayer.Weights);
-            clSetKernelArg(feedForwardSoftmaxSumKernel, 1, sizeof(cl_mem), &outputLayer.Biases);
-            clSetKernelArg(feedForwardSoftmaxSumKernel, 2, sizeof(cl_mem), &d_SoftmaxSums);
-            clSetKernelArg(feedForwardSoftmaxSumKernel, 3, sizeof(cl_mem), &lastHidden.Outputs);
-            clSetKernelArg(feedForwardSoftmaxSumKernel, 4, sizeof(int), &outputLayer.NumNeurons);
-            clSetKernelArg(feedForwardSoftmaxSumKernel, 5, sizeof(int), &outputLayer.NumInputs);
-            clSetKernelArg(feedForwardSoftmaxSumKernel, 6, sizeof(int), &lastHidden.NumNeurons);
-            err = clEnqueueNDRangeKernel(queue, feedForwardSoftmaxSumKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-            clFinish(queue);
-
-            float* h_sums = new float[outputLayer.NumNeurons];
-            clEnqueueReadBuffer(queue, d_SoftmaxSums, CL_TRUE, 0, outputLayer.NumNeurons * sizeof(float), h_sums, 0, NULL, NULL);
-            float maxVal = h_sums[0];
-            for (int i = 1; i < outputLayer.NumNeurons; i++)
-                if (h_sums[i] > maxVal) maxVal = h_sums[i];
-
-            float sumExp = 0;
-            for (int i = 0; i < outputLayer.NumNeurons; i++)
-                sumExp += expf(h_sums[i] - maxVal);
-
-            delete[] h_sums;
-
-            clSetKernelArg(softmaxKernel, 0, sizeof(cl_mem), &d_SoftmaxSums);
-            clSetKernelArg(softmaxKernel, 1, sizeof(cl_mem), &outputLayer.Outputs);
-            clSetKernelArg(softmaxKernel, 2, sizeof(int), &outputLayer.NumNeurons);
-            clSetKernelArg(softmaxKernel, 3, sizeof(float), &maxVal);
-            clSetKernelArg(softmaxKernel, 4, sizeof(float), &sumExp);
-            err = clEnqueueNDRangeKernel(queue, softmaxKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-        } else {
-            clSetKernelArg(feedForwardKernel, 0, sizeof(cl_mem), &outputLayer.Weights);
-            clSetKernelArg(feedForwardKernel, 1, sizeof(cl_mem), &outputLayer.Biases);
-            clSetKernelArg(feedForwardKernel, 2, sizeof(cl_mem), &outputLayer.Outputs);
-            clSetKernelArg(feedForwardKernel, 3, sizeof(cl_mem), &lastHidden.Outputs);
-            clSetKernelArg(feedForwardKernel, 4, sizeof(int), &outputLayer.NumNeurons);
-            clSetKernelArg(feedForwardKernel, 5, sizeof(int), &outputLayer.NumInputs);
-            clSetKernelArg(feedForwardKernel, 6, sizeof(int), &lastHidden.NumNeurons);
-            int actType = (int)outputLayer.ActivationType;
-            clSetKernelArg(feedForwardKernel, 7, sizeof(int), &actType);
-            err = clEnqueueNDRangeKernel(queue, feedForwardKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-        }
-        clFinish(queue);
-    }
-
-    // -------- Backpropagation --------
-    void BackPropagate() {
-        cl_int err;
-        LayerData& outputLayer = Layers[NumLayers - 1];
-        size_t globalSize = ((outputLayer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-        int isSoftmax = (OutputActivation == atSoftmax) ? 1 : 0;
-        int actType = (int)outputLayer.ActivationType;
-
-        clSetKernelArg(backPropOutputKernel, 0, sizeof(cl_mem), &outputLayer.Errors);
-        clSetKernelArg(backPropOutputKernel, 1, sizeof(cl_mem), &outputLayer.Outputs);
-        clSetKernelArg(backPropOutputKernel, 2, sizeof(cl_mem), &d_Target);
-        clSetKernelArg(backPropOutputKernel, 3, sizeof(int), &outputLayer.NumNeurons);
-        clSetKernelArg(backPropOutputKernel, 4, sizeof(int), &actType);
-        clSetKernelArg(backPropOutputKernel, 5, sizeof(int), &isSoftmax);
-
-        err = clEnqueueNDRangeKernel(queue, backPropOutputKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-        clFinish(queue);
-
-        for (int k = NumLayers - 2; k >= 1; k--) {
-            LayerData& layer = Layers[k];
-            LayerData& nextLayer = Layers[k + 1];
-            globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            actType = (int)layer.ActivationType;
-
-            clSetKernelArg(backPropHiddenKernel, 0, sizeof(cl_mem), &layer.Errors);
-            clSetKernelArg(backPropHiddenKernel, 1, sizeof(cl_mem), &layer.Outputs);
-            clSetKernelArg(backPropHiddenKernel, 2, sizeof(cl_mem), &layer.DropoutMask);
-            clSetKernelArg(backPropHiddenKernel, 3, sizeof(cl_mem), &nextLayer.Errors);
-            clSetKernelArg(backPropHiddenKernel, 4, sizeof(cl_mem), &nextLayer.Weights);
-            clSetKernelArg(backPropHiddenKernel, 5, sizeof(int), &layer.NumNeurons);
-            clSetKernelArg(backPropHiddenKernel, 6, sizeof(int), &actType);
-            clSetKernelArg(backPropHiddenKernel, 7, sizeof(int), &nextLayer.NumNeurons);
-            clSetKernelArg(backPropHiddenKernel, 8, sizeof(int), &nextLayer.NumInputs);
-
-            err = clEnqueueNDRangeKernel(queue, backPropHiddenKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-            clFinish(queue);
-        }
-    }
-
-    // -------- Weight update --------
-    void UpdateWeights() {
-        cl_int err;
-        Timestep++;
-        for (int k = NumLayers - 1; k >= 1; k--) {
-            LayerData& layer = Layers[k];
-            LayerData& prevLayer = Layers[k - 1];
-            size_t globalSize = ((layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
-            switch (Optimizer) {
-                case otSGD:
-                    clSetKernelArg(updateWeightsSGDKernel, 0, sizeof(cl_mem), &layer.Weights);
-                    clSetKernelArg(updateWeightsSGDKernel, 1, sizeof(cl_mem), &layer.Biases);
-                    clSetKernelArg(updateWeightsSGDKernel, 2, sizeof(cl_mem), &layer.Errors);
-                    clSetKernelArg(updateWeightsSGDKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
-                    clSetKernelArg(updateWeightsSGDKernel, 4, sizeof(int), &layer.NumNeurons);
-                    clSetKernelArg(updateWeightsSGDKernel, 5, sizeof(int), &layer.NumInputs);
-                    clSetKernelArg(updateWeightsSGDKernel, 6, sizeof(float), &LearningRate);
-                    clSetKernelArg(updateWeightsSGDKernel, 7, sizeof(float), &L2Lambda);
-                    err = clEnqueueNDRangeKernel(queue, updateWeightsSGDKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-                    break;
-                case otAdam:
-                    clSetKernelArg(updateWeightsAdamKernel, 0, sizeof(cl_mem), &layer.Weights);
-                    clSetKernelArg(updateWeightsAdamKernel, 1, sizeof(cl_mem), &layer.Biases);
-                    clSetKernelArg(updateWeightsAdamKernel, 2, sizeof(cl_mem), &layer.Errors);
-                    clSetKernelArg(updateWeightsAdamKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
-                    clSetKernelArg(updateWeightsAdamKernel, 4, sizeof(cl_mem), &layer.M);
-                    clSetKernelArg(updateWeightsAdamKernel, 5, sizeof(cl_mem), &layer.V);
-                    clSetKernelArg(updateWeightsAdamKernel, 6, sizeof(cl_mem), &layer.MBias);
-                    clSetKernelArg(updateWeightsAdamKernel, 7, sizeof(cl_mem), &layer.VBias);
-                    clSetKernelArg(updateWeightsAdamKernel, 8, sizeof(int), &layer.NumNeurons);
-                    clSetKernelArg(updateWeightsAdamKernel, 9, sizeof(int), &layer.NumInputs);
-                    clSetKernelArg(updateWeightsAdamKernel, 10, sizeof(float), &LearningRate);
-                    clSetKernelArg(updateWeightsAdamKernel, 11, sizeof(float), &L2Lambda);
-                    clSetKernelArg(updateWeightsAdamKernel, 12, sizeof(float), &Beta1);
-                    clSetKernelArg(updateWeightsAdamKernel, 13, sizeof(float), &Beta2);
-                    clSetKernelArg(updateWeightsAdamKernel, 14, sizeof(int), &Timestep);
-                    err = clEnqueueNDRangeKernel(queue, updateWeightsAdamKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-                    break;
-                case otRMSProp:
-                    clSetKernelArg(updateWeightsRMSPropKernel, 0, sizeof(cl_mem), &layer.Weights);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 1, sizeof(cl_mem), &layer.Biases);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 2, sizeof(cl_mem), &layer.Errors);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 3, sizeof(cl_mem), &prevLayer.Outputs);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 4, sizeof(cl_mem), &layer.V);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 5, sizeof(cl_mem), &layer.VBias);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 6, sizeof(int), &layer.NumNeurons);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 7, sizeof(int), &layer.NumInputs);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 8, sizeof(float), &LearningRate);
-                    clSetKernelArg(updateWeightsRMSPropKernel, 9, sizeof(float), &L2Lambda);
-                    err = clEnqueueNDRangeKernel(queue, updateWeightsRMSPropKernel, 1, NULL, &globalSize, NULL, 0, NULL, NULL); CL_CHECK(err);
-                    break;
+            for (int i = 0; i < FOutputSize; i++) {
+                double p = Predicted[i];
+                if (p < EPSILON) p = EPSILON;
+                if (p > 1 - EPSILON) p = 1 - EPSILON;
+                Result -= Target[i] * log(p);
             }
+        } else {
+            for (int i = 0; i < FOutputSize; i++)
+                Result += 0.5 * (Target[i] - Predicted[i]) * (Target[i] - Predicted[i]);
         }
-        clFinish(queue);
+
+        return Result;
     }
 
-        // -------- Save/load to file (double for file I/O) --------
+    int GetOutputSize() const { return FOutputSize; }
+    int GetInputSize() const { return FInputSize; }
+    int GetHiddenLayerCount() const { return FHiddenSizes.size(); }
+    const std::vector<int>& GetHiddenSizes() const { return FHiddenSizes; }
+    int GetNumLayers() const { return NumLayers; }
+
+    int GetLayerSize(int layerIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        return Layers[layerIdx].NumNeurons;
+    }
+
+    TActivationType GetLayerActivation(int layerIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return atSigmoid;
+        return Layers[layerIdx].ActivationType;
+    }
+
+    double GetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
+        float value;
+        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
+        clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, idx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    void SetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx, double value) {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
+        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return;
+        float fval = (float)value;
+        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
+        clEnqueueWriteBuffer(queue, layer.Weights, CL_TRUE, idx * sizeof(float), sizeof(float), &fval, 0, NULL, NULL);
+    }
+
+    std::vector<double> GetNeuronWeights(int layerIdx, int neuronIdx) const {
+        std::vector<double> result;
+        if (layerIdx < 0 || layerIdx >= NumLayers) return result;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return result;
+        float* values = new float[layer.NumInputs];
+        size_t offset = neuronIdx * layer.NumInputs;
+        clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, offset * sizeof(float), layer.NumInputs * sizeof(float), values, 0, NULL, NULL);
+        for (int i = 0; i < layer.NumInputs; i++)
+            result.push_back((double)values[i]);
+        delete[] values;
+        return result;
+    }
+
+    double GetNeuronBias(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.Biases, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    void SetNeuronBias(int layerIdx, int neuronIdx, double value) {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
+        float fval = (float)value;
+        clEnqueueWriteBuffer(queue, layer.Biases, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &fval, 0, NULL, NULL);
+    }
+
+    double GetNeuronOutput(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.Outputs, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    double GetNeuronError(int layerIdx, int neuronIdx) const {
+        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
+        LayerData& layer = Layers[layerIdx];
+        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
+        float value;
+        clEnqueueReadBuffer(queue, layer.Errors, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
+        return (double)value;
+    }
+
+    std::vector<double> GetLayerOutputs(int layerIdx) const {
+        std::vector<double> result;
+        if (layerIdx < 0 || layerIdx >= NumLayers) return result;
+        LayerData& layer = Layers[layerIdx];
+        float* values = new float[layer.NumNeurons];
+        clEnqueueReadBuffer(queue, layer.Outputs, CL_TRUE, 0, layer.NumNeurons * sizeof(float), values, 0, NULL, NULL);
+        for (int i = 0; i < layer.NumNeurons; i++)
+            result.push_back((double)values[i]);
+        delete[] values;
+        return result;
+    }
+
+    std::vector<int> GetActivationHistogram(int layerIdx, int bins) const {
+        std::vector<int> hist(bins, 0);
+        if (layerIdx < 0 || layerIdx >= NumLayers) return hist;
+        LayerData& layer = Layers[layerIdx];
+        std::vector<double> outputs = GetLayerOutputs(layerIdx);
+        for (auto val : outputs) {
+            int idx = (int)(val * bins);
+            if (idx < 0) idx = 0;
+            if (idx >= bins) idx = bins - 1;
+            hist[idx]++;
+        }
+        return hist;
+    }
+
+    std::vector<int> GetErrorHistogram(int layerIdx, int bins) const {
+        std::vector<int> hist(bins, 0);
+        if (layerIdx < 0 || layerIdx >= NumLayers) return hist;
+        LayerData& layer = Layers[layerIdx];
+        float* values = new float[layer.NumNeurons];
+        clEnqueueReadBuffer(queue, layer.Errors, CL_TRUE, 0, layer.NumNeurons * sizeof(float), values, 0, NULL, NULL);
+        for (int i = 0; i < layer.NumNeurons; i++) {
+            double absErr = fabs((double)values[i]);
+            int idx = (int)(absErr * bins);
+            if (idx < 0) idx = 0;
+            if (idx >= bins) idx = bins - 1;
+            hist[idx]++;
+        }
+        delete[] values;
+        return hist;
+    }
+
     bool Save(const char* filename) {
         FILE* f = fopen(filename, "wb");
         if (!f) return false;
@@ -748,7 +986,6 @@ public:
             float* h_V = new float[weightSize];
             float* h_MBias = new float[layer.NumNeurons];
             float* h_VBias = new float[layer.NumNeurons];
-            unsigned char* h_mask = new unsigned char[layer.NumNeurons];
 
             clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(float), h_weights, 0, NULL, NULL);
             clEnqueueReadBuffer(queue, layer.Biases, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_biases, 0, NULL, NULL);
@@ -756,30 +993,13 @@ public:
             clEnqueueReadBuffer(queue, layer.V, CL_TRUE, 0, weightSize * sizeof(float), h_V, 0, NULL, NULL);
             clEnqueueReadBuffer(queue, layer.MBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_MBias, 0, NULL, NULL);
             clEnqueueReadBuffer(queue, layer.VBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_VBias, 0, NULL, NULL);
-            clEnqueueReadBuffer(queue, layer.DropoutMask, CL_TRUE, 0, layer.NumNeurons * sizeof(unsigned char), h_mask, 0, NULL, NULL);
 
-            // Convert float to double for file format
-            double* d_weights = new double[weightSize];
-            double* d_biases = new double[layer.NumNeurons];
-            double* d_M = new double[weightSize];
-            double* d_V = new double[weightSize];
-            double* d_MBias = new double[layer.NumNeurons];
-            double* d_VBias = new double[layer.NumNeurons];
-
-            for (int i = 0; i < weightSize; i++) d_weights[i] = (double)h_weights[i];
-            for (int i = 0; i < layer.NumNeurons; i++) d_biases[i] = (double)h_biases[i];
-            for (int i = 0; i < weightSize; i++) d_M[i] = (double)h_M[i];
-            for (int i = 0; i < weightSize; i++) d_V[i] = (double)h_V[i];
-            for (int i = 0; i < layer.NumNeurons; i++) d_MBias[i] = (double)h_MBias[i];
-            for (int i = 0; i < layer.NumNeurons; i++) d_VBias[i] = (double)h_VBias[i];
-
-            fwrite(d_weights, sizeof(double), weightSize, f);
-            fwrite(d_biases, sizeof(double), layer.NumNeurons, f);
-            fwrite(d_M, sizeof(double), weightSize, f);
-            fwrite(d_V, sizeof(double), weightSize, f);
-            fwrite(d_MBias, sizeof(double), layer.NumNeurons, f);
-            fwrite(d_VBias, sizeof(double), layer.NumNeurons, f);
-            fwrite(h_mask, sizeof(unsigned char), layer.NumNeurons, f);
+            fwrite(h_weights, sizeof(float), weightSize, f);
+            fwrite(h_biases, sizeof(float), layer.NumNeurons, f);
+            fwrite(h_M, sizeof(float), weightSize, f);
+            fwrite(h_V, sizeof(float), weightSize, f);
+            fwrite(h_MBias, sizeof(float), layer.NumNeurons, f);
+            fwrite(h_VBias, sizeof(float), layer.NumNeurons, f);
 
             delete[] h_weights;
             delete[] h_biases;
@@ -787,14 +1007,8 @@ public:
             delete[] h_V;
             delete[] h_MBias;
             delete[] h_VBias;
-            delete[] d_weights;
-            delete[] d_biases;
-            delete[] d_M;
-            delete[] d_V;
-            delete[] d_MBias;
-            delete[] d_VBias;
-            delete[] h_mask;
         }
+
         fclose(f);
         return true;
     }
@@ -826,7 +1040,9 @@ public:
         fread(&outAct, sizeof(int), 1, f);
 
         TMultiLayerPerceptronOpenCLFacaded* mlp = new TMultiLayerPerceptronOpenCLFacaded(
-            inputSize, hiddenSizes, outputSize, (TActivationType)hidAct, (TActivationType)outAct);
+            inputSize, hiddenSizes, outputSize,
+            (TActivationType)hidAct, (TActivationType)outAct);
+
         mlp->LearningRate = learningRate;
         mlp->Optimizer = (TOptimizerType)opt;
 
@@ -845,23 +1061,6 @@ public:
             LayerData& layer = mlp->Layers[k];
             int weightSize = layer.NumNeurons * layer.NumInputs;
 
-            double* d_weights = new double[weightSize];
-            double* d_biases = new double[layer.NumNeurons];
-            double* d_M = new double[weightSize];
-            double* d_V = new double[weightSize];
-            double* d_MBias = new double[layer.NumNeurons];
-            double* d_VBias = new double[layer.NumNeurons];
-            unsigned char* h_mask = new unsigned char[layer.NumNeurons];
-
-            fread(d_weights, sizeof(double), weightSize, f);
-            fread(d_biases, sizeof(double), layer.NumNeurons, f);
-            fread(d_M, sizeof(double), weightSize, f);
-            fread(d_V, sizeof(double), weightSize, f);
-            fread(d_MBias, sizeof(double), layer.NumNeurons, f);
-            fread(d_VBias, sizeof(double), layer.NumNeurons, f);
-            fread(h_mask, sizeof(unsigned char), layer.NumNeurons, f);
-
-            // Convert double to float
             float* h_weights = new float[weightSize];
             float* h_biases = new float[layer.NumNeurons];
             float* h_M = new float[weightSize];
@@ -869,12 +1068,12 @@ public:
             float* h_MBias = new float[layer.NumNeurons];
             float* h_VBias = new float[layer.NumNeurons];
 
-            for (int i = 0; i < weightSize; i++) h_weights[i] = (float)d_weights[i];
-            for (int i = 0; i < layer.NumNeurons; i++) h_biases[i] = (float)d_biases[i];
-            for (int i = 0; i < weightSize; i++) h_M[i] = (float)d_M[i];
-            for (int i = 0; i < weightSize; i++) h_V[i] = (float)d_V[i];
-            for (int i = 0; i < layer.NumNeurons; i++) h_MBias[i] = (float)d_MBias[i];
-            for (int i = 0; i < layer.NumNeurons; i++) h_VBias[i] = (float)d_VBias[i];
+            fread(h_weights, sizeof(float), weightSize, f);
+            fread(h_biases, sizeof(float), layer.NumNeurons, f);
+            fread(h_M, sizeof(float), weightSize, f);
+            fread(h_V, sizeof(float), weightSize, f);
+            fread(h_MBias, sizeof(float), layer.NumNeurons, f);
+            fread(h_VBias, sizeof(float), layer.NumNeurons, f);
 
             clEnqueueWriteBuffer(mlp->queue, layer.Weights, CL_TRUE, 0, weightSize * sizeof(float), h_weights, 0, NULL, NULL);
             clEnqueueWriteBuffer(mlp->queue, layer.Biases, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_biases, 0, NULL, NULL);
@@ -882,239 +1081,19 @@ public:
             clEnqueueWriteBuffer(mlp->queue, layer.V, CL_TRUE, 0, weightSize * sizeof(float), h_V, 0, NULL, NULL);
             clEnqueueWriteBuffer(mlp->queue, layer.MBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_MBias, 0, NULL, NULL);
             clEnqueueWriteBuffer(mlp->queue, layer.VBias, CL_TRUE, 0, layer.NumNeurons * sizeof(float), h_VBias, 0, NULL, NULL);
-            clEnqueueWriteBuffer(mlp->queue, layer.DropoutMask, CL_TRUE, 0, layer.NumNeurons * sizeof(unsigned char), h_mask, 0, NULL, NULL);
 
-            delete[] d_weights; delete[] d_biases; delete[] d_M; delete[] d_V; delete[] d_MBias; delete[] d_VBias;
-            delete[] h_weights; delete[] h_biases; delete[] h_M; delete[] h_V; delete[] h_MBias; delete[] h_VBias;
-            delete[] h_mask;
+            delete[] h_weights;
+            delete[] h_biases;
+            delete[] h_M;
+            delete[] h_V;
+            delete[] h_MBias;
+            delete[] h_VBias;
         }
 
         fclose(f);
         return mlp;
     }
-    // -------- Predict, Train, Loss --------
-    void Predict(const double* Input, double* Result) {
-        FIsTraining = false;
-        float* h_input = new float[FInputSize + 1];
-        for (int i = 0; i < FInputSize; i++) h_input[i] = (float)Input[i];
-        h_input[FInputSize] = 1.0f;
-        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
-        delete[] h_input;
 
-        FeedForward();
-
-        float* h_out = new float[FOutputSize];
-        clEnqueueReadBuffer(queue, Layers[NumLayers - 1].Outputs, CL_TRUE, 0, FOutputSize * sizeof(float), h_out, 0, NULL, NULL);
-        for (int i = 0; i < FOutputSize; i++) Result[i] = (double)h_out[i];
-        delete[] h_out;
-
-        FIsTraining = true;
-    }
-
-    void Train(const double* Input, const double* Target) {
-        FIsTraining = true;
-        float* h_input = new float[FInputSize + 1];
-        for (int i = 0; i < FInputSize; i++) h_input[i] = (float)Input[i];
-        h_input[FInputSize] = 1.0f;
-        clEnqueueWriteBuffer(queue, Layers[0].Outputs, CL_TRUE, 0, (FInputSize + 1) * sizeof(float), h_input, 0, NULL, NULL);
-        delete[] h_input;
-
-        float* h_target = new float[FOutputSize];
-        for (int i = 0; i < FOutputSize; i++) h_target[i] = (float)Target[i];
-        clEnqueueWriteBuffer(queue, d_Target, CL_TRUE, 0, FOutputSize * sizeof(float), h_target, 0, NULL, NULL);
-        delete[] h_target;
-
-        FeedForward();
-        BackPropagate();
-        UpdateWeights();
-    }
-
-    double ComputeLoss(const double* Predicted, const double* Target) {
-        double Result = 0;
-        if (OutputActivation == atSoftmax) {
-            for (int i = 0; i < FOutputSize; i++) {
-                double p = Predicted[i];
-                if (p < EPSILON) p = EPSILON;
-                if (p > 1 - EPSILON) p = 1 - EPSILON;
-                Result -= Target[i] * log(p);
-            }
-        } else {
-            for (int i = 0; i < FOutputSize; i++)
-                Result += 0.5 * (Target[i] - Predicted[i]) * (Target[i] - Predicted[i]);
-        }
-        return Result;
-    }
-
-    // -------- Facade: Layer/Neuron Inspection --------
-    // Get weights count for neuron
-    int GetWeightsPerNeuron(int layerIdx, int neuronIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
-        if (neuronIdx < 0 || neuronIdx >= Layers[layerIdx].NumNeurons) return 0;
-        return Layers[layerIdx].NumInputs;
-    }
-
-    // Get single weight
-    double GetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
-        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return 0;
-        float value;
-        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
-        clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, idx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
-        return (double)value;
-    }
-
-    // Set single weight
-    void SetNeuronWeight(int layerIdx, int neuronIdx, int weightIdx, double value) {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
-        if (weightIdx < 0 || weightIdx >= layer.NumInputs) return;
-        float v = (float)value;
-        size_t idx = neuronIdx * layer.NumInputs + weightIdx;
-        clEnqueueWriteBuffer(queue, layer.Weights, CL_TRUE, idx * sizeof(float), sizeof(float), &v, 0, NULL, NULL);
-    }
-
-    // Get all weights
-    std::vector<double> GetNeuronWeights(int layerIdx, int neuronIdx) const {
-        std::vector<double> res;
-        if (layerIdx < 0 || layerIdx >= NumLayers) return res;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return res;
-        res.resize(layer.NumInputs);
-        std::vector<float> temp(layer.NumInputs);
-        size_t idx = neuronIdx * layer.NumInputs;
-        clEnqueueReadBuffer(queue, layer.Weights, CL_TRUE, idx * sizeof(float), layer.NumInputs * sizeof(float), temp.data(), 0, NULL, NULL);
-        for (int i = 0; i < layer.NumInputs; i++) res[i] = (double)temp[i];
-        return res;
-    }
-
-    // Get bias
-    double GetNeuronBias(int layerIdx, int neuronIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
-        float value;
-        clEnqueueReadBuffer(queue, layer.Biases, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
-        return (double)value;
-    }
-    // Set bias
-    void SetNeuronBias(int layerIdx, int neuronIdx, double value) {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return;
-        float v = (float)value;
-        clEnqueueWriteBuffer(queue, layer.Biases, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &v, 0, NULL, NULL);
-    }
-
-    // Get neuron output
-    double GetNeuronOutput(int layerIdx, int neuronIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
-        float value;
-        clEnqueueReadBuffer(queue, layer.Outputs, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
-        return (double)value;
-    }
-
-    // Get all outputs for layer
-    std::vector<double> GetLayerOutputs(int layerIdx) const {
-        std::vector<double> res;
-        if (layerIdx < 0 || layerIdx >= NumLayers) return res;
-        LayerData& layer = Layers[layerIdx];
-        res.resize(layer.NumNeurons);
-        std::vector<float> temp(layer.NumNeurons);
-        clEnqueueReadBuffer(queue, layer.Outputs, CL_TRUE, 0, layer.NumNeurons * sizeof(float), temp.data(), 0, NULL, NULL);
-        for (int i = 0; i < layer.NumNeurons; i++) res[i] = (double)temp[i];
-        return res;
-    }
-
-    // Errors
-    double GetNeuronError(int layerIdx, int neuronIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
-        float value;
-        clEnqueueReadBuffer(queue, layer.Errors, CL_TRUE, neuronIdx * sizeof(float), sizeof(float), &value, 0, NULL, NULL);
-        return (double)value;
-    }
-    std::vector<double> GetLayerErrors(int layerIdx) const {
-        std::vector<double> res;
-        if (layerIdx < 0 || layerIdx >= NumLayers) return res;
-        LayerData& layer = Layers[layerIdx];
-        res.resize(layer.NumNeurons);
-        std::vector<float> temp(layer.NumNeurons);
-        clEnqueueReadBuffer(queue, layer.Errors, CL_TRUE, 0, layer.NumNeurons * sizeof(float), temp.data(), 0, NULL, NULL);
-        for (int i = 0; i < layer.NumNeurons; i++) res[i] = (double)temp[i];
-        return res;
-    }
-
-    // Dropout mask
-    unsigned char GetDropoutMask(int layerIdx, int neuronIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
-        LayerData& layer = Layers[layerIdx];
-        if (neuronIdx < 0 || neuronIdx >= layer.NumNeurons) return 0;
-        unsigned char value;
-        clEnqueueReadBuffer(queue, layer.DropoutMask, CL_TRUE, neuronIdx * sizeof(unsigned char), sizeof(unsigned char), &value, 0, NULL, NULL);
-        return value;
-    }
-
-    // Activation type
-    TActivationType GetLayerActivation(int layerIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return atSigmoid;
-        return Layers[layerIdx].ActivationType;
-    }
-
-    // Histogram of activations
-    std::vector<int> GetActivationHistogram(int layerIdx, int numBins = 20) const {
-        std::vector<int> histogram(numBins, 0);
-        if (layerIdx < 0 || layerIdx >= NumLayers) return histogram;
-        std::vector<double> outs = GetLayerOutputs(layerIdx);
-        if (outs.empty()) return histogram;
-        double minVal = *std::min_element(outs.begin(), outs.end());
-        double maxVal = *std::max_element(outs.begin(), outs.end());
-        if (maxVal == minVal) maxVal = minVal + 1.0;
-        double binWidth = (maxVal - minVal) / numBins;
-        for (double v : outs) {
-            int bin = (int)((v - minVal) / binWidth);
-            if (bin < 0) bin = 0;
-            if (bin >= numBins) bin = numBins - 1;
-            histogram[bin]++;
-        }
-        return histogram;
-    }
-    // Histogram of errors
-    std::vector<int> GetErrorHistogram(int layerIdx, int numBins = 20) const {
-        std::vector<int> histogram(numBins, 0);
-        if (layerIdx < 0 || layerIdx >= NumLayers) return histogram;
-        std::vector<double> errs = GetLayerErrors(layerIdx);
-        if (errs.empty()) return histogram;
-        double minVal = *std::min_element(errs.begin(), errs.end());
-        double maxVal = *std::max_element(errs.begin(), errs.end());
-        if (maxVal == minVal) maxVal = minVal + 1.0;
-        double binWidth = (maxVal - minVal) / numBins;
-        for (double v : errs) {
-            int bin = (int)((v - minVal) / binWidth);
-            if (bin < 0) bin = 0;
-            if (bin >= numBins) bin = numBins - 1;
-            histogram[bin]++;
-        }
-        return histogram;
-    }
-
-    // Get model and layer size information for CLI
-    int GetOutputSize() const { return FOutputSize; }
-    int GetInputSize() const { return FInputSize; }
-    int GetHiddenLayerCount() const { return FHiddenSizes.size(); }
-    const std::vector<int>& GetHiddenSizes() const { return FHiddenSizes; }
-    int GetNumLayers() const { return NumLayers; }
-    int GetLayerSize(int layerIdx) const {
-        if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
-        return Layers[layerIdx].NumNeurons;
-    }
-
-    // ------ Extra optimizer state inspection (facade)
     double GetWeightM(int layerIdx, int neuronIdx, int weightIdx) const {
         if (layerIdx < 0 || layerIdx >= NumLayers) return 0;
         LayerData& layer = Layers[layerIdx];
@@ -1153,10 +1132,11 @@ public:
     }
 };
 
-// Utility functions and main
+// Utility functions
 double RandomDouble() {
     return (double)rand() / RAND_MAX;
 }
+
 int MaxIndex(const double* arr, int n) {
     int result = 0;
     for (int i = 1; i < n; i++)
@@ -1164,6 +1144,7 @@ int MaxIndex(const double* arr, int n) {
             result = i;
     return result;
 }
+
 struct DataPoint {
     std::vector<double> Input;
     std::vector<double> Target;
@@ -1194,11 +1175,13 @@ TActivationType ParseActivation(const char* s) {
     if (strcasecmp(s, "softmax") == 0) return atSoftmax;
     return atSigmoid;
 }
+
 TOptimizerType ParseOptimizer(const char* s) {
     if (strcasecmp(s, "adam") == 0) return otAdam;
     if (strcasecmp(s, "rmsprop") == 0) return otRMSProp;
     return otSGD;
 }
+
 std::vector<int> ParseIntArray(const char* s) {
     std::vector<int> result;
     std::stringstream ss(s);
@@ -1208,6 +1191,7 @@ std::vector<int> ParseIntArray(const char* s) {
     }
     return result;
 }
+
 std::vector<double> ParseDoubleArray(const char* s) {
     std::vector<double> result;
     std::stringstream ss(s);
@@ -1217,15 +1201,18 @@ std::vector<double> ParseDoubleArray(const char* s) {
     }
     return result;
 }
+
 std::vector<DataPoint> LoadDataCSV(const char* filename, int inputSize, int outputSize) {
     std::vector<DataPoint> data;
     std::ifstream file(filename);
     if (!file.is_open()) return data;
+
     std::string line;
     while (std::getline(file, line)) {
         if (line.empty()) continue;
         std::vector<double> values = ParseDoubleArray(line.c_str());
         if ((int)values.size() < inputSize + outputSize) continue;
+
         DataPoint dp;
         dp.Input.resize(inputSize);
         dp.Target.resize(outputSize);
@@ -1235,15 +1222,18 @@ std::vector<DataPoint> LoadDataCSV(const char* filename, int inputSize, int outp
     }
     return data;
 }
+
 void ShuffleData(std::vector<DataPoint>& data) {
     for (int i = data.size() - 1; i >= 1; i--) {
         int j = rand() % (i + 1);
         std::swap(data[i], data[j]);
     }
 }
+
 void NormalizeData(std::vector<DataPoint>& data) {
     if (data.empty()) return;
     int inputSize = data[0].Input.size();
+
     std::vector<double> mins(inputSize), maxs(inputSize);
     for (int j = 0; j < inputSize; j++) {
         mins[j] = maxs[j] = data[0].Input[j];
@@ -1280,7 +1270,6 @@ void PrintUsage() {
         "  histogram   Print activation histogram\n"
         "  get-optimizer Print optimizer value\n"
         "  help        Print usage\n");
-    // Show options/usage strings
 }
 
 int main(int argc, char** argv) {
@@ -1400,6 +1389,7 @@ int main(int argc, char** argv) {
         if (hiddenSizes.empty()) { printf("Error: --hidden is required\n"); return 1; }
         if (outputSize <= 0) { printf("Error: --output is required\n"); return 1; }
         if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
+
         TMultiLayerPerceptronOpenCLFacaded* mlp = new TMultiLayerPerceptronOpenCLFacaded(
             inputSize, hiddenSizes, outputSize, hiddenAct, outputAct);
         mlp->LearningRate = (float)learningRate;
@@ -1408,16 +1398,32 @@ int main(int argc, char** argv) {
         mlp->L2Lambda = (float)l2Lambda;
         mlp->Beta1 = (float)beta1;
         mlp->Beta2 = (float)beta2;
+
         mlp->Save(saveFile.c_str());
-        printf("Model created on device: %s\n", deviceName);
+
+        printf("Created OpenCL MLP model (Device: %s):\n", deviceName);
+        printf("  Input size: %d\n", inputSize);
+        printf("  Hidden sizes: ");
+        for (size_t i = 0; i < hiddenSizes.size(); i++)
+            printf("%s%d", i > 0 ? "," : "", hiddenSizes[i]);
+        printf("\n");
+        printf("  Output size: %d\n", outputSize);
+        printf("  Hidden activation: %s\n", ActivationToStr(hiddenAct));
+        printf("  Output activation: %s\n", ActivationToStr(outputAct));
+        printf("  Optimizer: %s\n", OptimizerToStr(optimizer));
+        printf("  Learning rate: %.4f\n", learningRate);
+        printf("  Saved to: %s\n", saveFile.c_str());
+
         delete mlp;
     }
     else if (command == cmdTrain) {
-        if (modelFile.empty()) { printf("Error: --model required\n"); return 1; }
-        if (dataFile.empty()) { printf("Error: --data required\n"); return 1; }
-        if (saveFile.empty()) { printf("Error: --save required\n"); return 1; }
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (dataFile.empty()) { printf("Error: --data is required\n"); return 1; }
+        if (saveFile.empty()) { printf("Error: --save is required\n"); return 1; }
+
         TMultiLayerPerceptronOpenCLFacaded* mlp = TMultiLayerPerceptronOpenCLFacaded::Load(modelFile.c_str());
-        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+        if (!mlp) { printf("Error: Failed to load model: %s\n", modelFile.c_str()); return 1; }
+
         if (lrOverride) mlp->LearningRate = (float)learningRate;
         mlp->EnableLRDecay = lrDecay;
         mlp->LRDecayRate = (float)lrDecayRate;
@@ -1426,15 +1432,26 @@ int main(int argc, char** argv) {
         mlp->EarlyStoppingPatience = patience;
 
         std::vector<DataPoint> data = LoadDataCSV(dataFile.c_str(), mlp->GetInputSize(), mlp->GetOutputSize());
-        if (data.empty()) { printf("Error: No valid data\n"); delete mlp; return 1; }
+        if (data.empty()) { printf("Error: No valid data loaded\n"); delete mlp; return 1; }
+
         printf("Using Device: %s\n", deviceName);
         printf("Loaded %zu training samples\n", data.size());
-        if (normalize) { NormalizeData(data); printf("Data normalized\n"); }
+        if (batchSize > 1)
+            printf("Note: Batch size %d specified (online training used)\n", batchSize);
+
+        if (normalize) {
+            NormalizeData(data);
+            printf("Data normalized\n");
+        }
+
         double* output = new double[mlp->GetOutputSize()];
+
         for (int epoch = 1; epoch <= epochs; epoch++) {
             ShuffleData(data);
+
             for (auto& dp : data)
                 mlp->Train(dp.Input.data(), dp.Target.data());
+
             if (verbose && (epoch % 10 == 0 || epoch == 1)) {
                 double totalLoss = 0;
                 for (auto& dp : data) {
@@ -1444,15 +1461,19 @@ int main(int argc, char** argv) {
                 printf("Epoch %d/%d - Loss: %.6f\n", epoch, epochs, totalLoss / data.size());
             }
         }
+
         double totalLoss = 0;
         for (auto& dp : data) {
             mlp->Predict(dp.Input.data(), output);
             totalLoss += mlp->ComputeLoss(output, dp.Target.data());
         }
         printf("Final loss: %.6f\n", totalLoss / data.size());
+
+        delete[] output;
+
         mlp->Save(saveFile.c_str());
         printf("Model saved to: %s\n", saveFile.c_str());
-        delete[] output;
+
         delete mlp;
     }
     else if (command == cmdPredict) {
@@ -1492,7 +1513,7 @@ int main(int argc, char** argv) {
         printf("Output activation: %s\n", ActivationToStr(mlp->OutputActivation));
         printf("Dropout rate: %.4f\n", mlp->DropoutRate);
         printf("L2 lambda: %.6f\n", mlp->L2Lambda);
-        printf("Beta1: %.4f\n", mlp->Beta1); printf(" Beta2: %.4f\n", mlp->Beta2); printf("Timestep: %d\n", mlp->Timestep);
+        printf("Beta1: %.4f\n", mlp->Beta1); printf("Beta2: %.4f\n", mlp->Beta2); printf("Timestep: %d\n", mlp->Timestep);
         printf("Total layers: %d\n", mlp->GetNumLayers());
         for (int i = 0; i < mlp->GetNumLayers(); i++)
             printf("  Layer %d: %d neurons\n", i, mlp->GetLayerSize(i));
@@ -1561,7 +1582,7 @@ int main(int argc, char** argv) {
                 printf("Error: Expected %d input values\n", mlp->GetInputSize()); delete mlp; return 1;
             }
             double* tmp = new double[mlp->GetOutputSize()];
-            mlp->Predict(inputValues.data(), tmp); // run forward pass
+            mlp->Predict(inputValues.data(), tmp);
             delete[] tmp;
         }
         double out = mlp->GetNeuronOutput(layerIdx, neuronIdx);
@@ -1613,7 +1634,7 @@ int main(int argc, char** argv) {
         if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
         printf("Layer %d, Neuron %d\n", layerIdx, neuronIdx);
         printf(" M: %.8f V: %.8f\n", mlp->GetBiasM(layerIdx, neuronIdx), mlp->GetBiasV(layerIdx, neuronIdx));
-        if (weightIdx >= 0) // optional
+        if (weightIdx >= 0)
             printf(" M_w[%d]: %.8f V_w[%d]: %.8f\n", weightIdx, mlp->GetWeightM(layerIdx, neuronIdx, weightIdx),
                    weightIdx, mlp->GetWeightV(layerIdx, neuronIdx, weightIdx));
         delete mlp;
