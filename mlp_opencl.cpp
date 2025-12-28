@@ -9,8 +9,7 @@
 // Compile:
 //   g++ -o mlp_opencl mlp_opencl.cpp -lOpenCL -std=c++11
 //
-// Usage: Same as CUDA version
-//
+
 
 #define CL_TARGET_OPENCL_VERSION 120
 #ifdef __APPLE__
