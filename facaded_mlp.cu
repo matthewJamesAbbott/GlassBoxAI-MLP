@@ -5,68 +5,70 @@
 //
 // Matthew Abbott 2025
 //
-// Compile: 
-//   nvcc -o mlpcuda facaded_mlp.cu -lcurand
+// Compile:
+//   nvcc -o facaded_mlp_cuda facaded_mlp_cuda.cu -lcurand
 //
-// Usage (core commands):
-//   mlpcuda create --input=N --hidden=N,N,... --output=N [options] --save=FILE
-//   mlpcuda train --model=FILE --data=FILE [options] --save=FILE
-//   mlpcuda predict --model=FILE --input=v1,v2,...
-//   mlpcuda info --model=FILE
-//   mlpcuda help
+// Usage (commands):
+//   facaded_mlp_cuda create --input=N --hidden=N,N,... --output=N [options] --save=FILE
+//   facaded_mlp_cuda train --model=FILE --data=FILE [options] --save=FILE
+//   facaded_mlp_cuda predict --model=FILE --input=v1,v2,...
+//   facaded_mlp_cuda info --model=FILE
+//   facaded_mlp_cuda get-weight --model=FILE --layer=L --neuron=N --weight=W
+//   facaded_mlp_cuda set-weight --model=FILE --layer=L --neuron=N --weight=W --value=V --save=FILE
+//   facaded_mlp_cuda get-weights --model=FILE --layer=L --neuron=N
+//   facaded_mlp_cuda get-bias --model=FILE --layer=L --neuron=N
+//   facaded_mlp_cuda set-bias --model=FILE --layer=L --neuron=N --value=V --save=FILE
+//   facaded_mlp_cuda get-output --model=FILE --layer=L --neuron=N [--run-input=v1,v2,...]
+//   facaded_mlp_cuda get-error --model=FILE --layer=L --neuron=N
+//   facaded_mlp_cuda layer-info --model=FILE --layer=L [--run-input=v1,v2,...]
+//   facaded_mlp_cuda histogram --model=FILE --layer=L [--bins=N] [--type=activation|gradient] [--run-input=v1,v2,...]
+//   facaded_mlp_cuda get-optimizer --model=FILE --layer=L --neuron=N [--weight=W]
+//   facaded_mlp_cuda help
 //
-// Options:
-//   --input=N                  Input layer size
-//   --hidden=N,N,...           Hidden layer sizes (comma-separated)
-//   --output=N                 Output layer size
-//   --save=FILE                Save model to file
+// Standard Options:
+//   --input=N                  Input layer size (create) or input values (predict/get-output)
+//   --hidden=N,N,...           Hidden layer sizes (comma-separated, required for create)
+//   --output=N                 Output layer size (required for create)
+//   --save=FILE                Save model to file (required for create/train/set-*)
 //   --model=FILE               Model file to load
-//   --data=FILE                Training data CSV
-//   --lr=VALUE                 Learning rate
-//   --optimizer=TYPE           sgd|adam|rmsprop
-//   --hidden-act=TYPE          sigmoid|tanh|relu|softmax
-//   --output-act=TYPE          sigmoid|tanh|relu|softmax
-//   --dropout=VALUE            Dropout rate 0-1
-//   --l2=VALUE                 L2 regularization
-//   --beta1=VALUE              Adam beta1
-//   --beta2=VALUE              Adam beta2
-//   --epochs=N                 Training epochs
-//   --batch=N                  Training batch size
+//   --data=FILE                Training data CSV file
+//   --lr=VALUE                 Learning rate (default: 0.1)
+//   --optimizer=TYPE           sgd|adam|rmsprop (default: sgd)
+//   --hidden-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
+//   --output-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
+//   --dropout=VALUE            Dropout rate 0-1 (default: 0)
+//   --l2=VALUE                 L2 regularization (default: 0)
+//   --beta1=VALUE              Adam beta1 (default: 0.9)
+//   --beta2=VALUE              Adam beta2 (default: 0.999)
+//   --epochs=N                 Training epochs (default: 100)
+//   --batch=N                  Training batch size (default: 1)
 //   --lr-decay                 Enable learning rate decay
-//   --lr-decay-rate=VALUE      Learning rate decay rate
-//   --lr-decay-epochs=N        Iterations between learning rate decay
+//   --lr-decay-rate=VALUE      Learning rate decay rate (default: 0.95)
+//   --lr-decay-epochs=N        Iterations between learning rate decay (default: 10)
 //   --early-stop               Enable early stopping
-//   --patience=N               Early stopping patience
+//   --patience=N               Early stopping patience (default: 10)
 //   --normalize                Normalize input data before training
 //   --verbose                  Show training progress
 //
-// Facade Inspection/Modification Commands:
-//   get-weight     --model=FILE --layer=N --neuron=N --weight=N
-//   set-weight     --model=FILE --layer=N --neuron=N --weight=N --value=V --save=FILE
-//   get-weights    --model=FILE --layer=N --neuron=N
-//   get-bias       --model=FILE --layer=N --neuron=N
-//   set-bias       --model=FILE --layer=N --neuron=N --value=V --save=FILE
-//   get-output     --model=FILE --layer=N [--run-input=V1,V2,...]
-//   get-error      --model=FILE --layer=N [after train step]
-//   layer-info     --model=FILE --layer=N [--run-input=V1,V2,...]
-//   histogram      --model=FILE --layer=N --type=activation|gradient [--run-input=V1,V2,...] [--bins=N]
-//   get-optimizer  --model=FILE --layer=N --neuron=N [--weight=N]
+// Facade Options:
+//   --layer=L                  Layer index for facade commands
+//   --neuron=N                 Neuron index for facade commands
+//   --weight=W                 Weight index for facade commands (within neuron)
+//   --value=V                  Value for set-* commands
+//   --bins=N                   Number of histogram bins (default: 20)
+//   --type=TYPE                Histogram type: activation|gradient (default: activation)
+//   --run-input=v1,v2,...      Input values for get-output/layer-info/histogram (optional)
 //
 // Examples:
-//   mlpcuda create --input=2 --hidden=8 --output=1 --save=xor.bin
-//   mlpcuda train --model=xor.bin --data=xor_cuda.csv --epochs=1000 --save=xor_trained.bin
-//   mlpcuda predict --model=xor_trained.bin --input=1,0
-//   mlpcuda info --model=xor_trained.bin
-//
-//   # Facade (model inspection/hacking):
-//   mlpcuda get-weight --model=m.bin --layer=1 --neuron=0 --weight=2
-//   mlpcuda set-weight --model=m.bin --layer=1 --neuron=0 --weight=2 --value=0.5 --save=m.bin
-//   mlpcuda get-weights --model=m.bin --layer=1 --neuron=0
-//   mlpcuda get-bias --model=m.bin --layer=1 --neuron=0
-//   mlpcuda get-output --model=m.bin --layer=1 --run-input=1,0
-//   mlpcuda layer-info --model=m.bin --layer=1 --run-input=1,0
-//   mlpcuda histogram --model=m.bin --layer=1 --type=activation --run-input=1,0
-//   mlpcuda get-optimizer --model=m.bin --layer=1 --neuron=0 --weight=0
+//   facaded_mlp_cuda create --input=2 --hidden=8 --output=1 --save=xor.bin
+//   facaded_mlp_cuda train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin
+//   facaded_mlp_cuda predict --model=xor_trained.bin --input=1,0
+//   facaded_mlp_cuda info --model=xor_trained.bin
+//   facaded_mlp_cuda get-weight --model=xor.bin --layer=0 --neuron=0 --weight=0
+//   facaded_mlp_cuda set-weight --model=xor.bin --layer=0 --neuron=0 --weight=0 --value=0.5 --save=xor_mod.bin
+//   facaded_mlp_cuda get-output --model=xor.bin --layer=1 --neuron=0 --run-input=1,0
+//   facaded_mlp_cuda layer-info --model=xor.bin --layer=1 --run-input=1,0
+//   facaded_mlp_cuda histogram --model=xor.bin --layer=1 --type=activation --run-input=1,0
 //
 
 #include <cuda_runtime.h>
@@ -1098,14 +1100,24 @@ int MaxIndex(const double* arr, int n) {
 }
 
 void PrintUsage() {
-    printf("MLPCuda - CUDA Command-line Multi-Layer Perceptron\n");
+    printf("Facaded MLP CUDA - Command-line Multi-Layer Perceptron (w/ Facade)\n");
     printf("\n");
     printf("Commands:\n");
-    printf("  create   Create a new MLP model\n");
-    printf("  train    Train an existing model with data\n");
-    printf("  predict  Make predictions with a trained model\n");
-    printf("  info     Display model information\n");
-    printf("  help     Show this help message\n");
+    printf("  create         Create a new MLP model\n");
+    printf("  train          Train an existing model with data\n");
+    printf("  predict        Make predictions with a trained model\n");
+    printf("  info           Display model information\n");
+    printf("  get-weight     Get a single weight value\n");
+    printf("  set-weight     Set a single weight value\n");
+    printf("  get-weights    Get all weights for a neuron\n");
+    printf("  get-bias       Get bias value for a neuron\n");
+    printf("  set-bias       Set bias value for a neuron\n");
+    printf("  get-output     Get neuron output value\n");
+    printf("  get-error      Get neuron error value\n");
+    printf("  layer-info     Display layer information\n");
+    printf("  histogram      Display activation or gradient histogram\n");
+    printf("  get-optimizer  Get optimizer state values (M, V for Adam/RMSProp)\n");
+    printf("  help           Show this help message\n");
     printf("\n");
     printf("Create Options:\n");
     printf("  --input=N              Input layer size (required)\n");
@@ -1143,49 +1155,31 @@ void PrintUsage() {
     printf("Info Options:\n");
     printf("  --model=FILE           Model file to load (required)\n");
     printf("\n");
-    printf("Facade Commands (inspect/modify model internals):\n");
-    printf("  get-weight   Get a specific weight value\n");
-    printf("  set-weight   Set a specific weight value\n");
-    printf("  get-weights  Get all weights for a neuron\n");
-    printf("  get-bias     Get a neuron's bias\n");
-    printf("  set-bias     Set a neuron's bias\n");
-    printf("  get-output   Get neuron outputs (after predict)\n");
-    printf("  get-error    Get neuron errors (after train step)\n");
-    printf("  layer-info   Show detailed layer information\n");
-    printf("  histogram    Show activation/gradient histogram\n");
-    printf("  get-optimizer Get optimizer state (M/V values)\n");
-    printf("\n");
     printf("Facade Options:\n");
-    printf("  --model=FILE           Model file (required)\n");
-    printf("  --layer=N              Layer index (0=input, 1+=hidden, last=output)\n");
-    printf("  --neuron=N             Neuron index within layer\n");
-    printf("  --weight=N             Weight index within neuron\n");
-    printf("  --value=V              Value to set\n");
-    printf("  --save=FILE            Save modified model\n");
-    printf("  --type=TYPE            Histogram type: activation|gradient\n");
+    printf("  --layer=L              Layer index (required for facade commands)\n");
+    printf("  --neuron=N             Neuron index (required for most facade commands)\n");
+    printf("  --weight=W             Weight index within neuron (for weight commands)\n");
+    printf("  --value=V              Value to set (required for set-* commands)\n");
     printf("  --bins=N               Number of histogram bins (default: 20)\n");
-    printf("  --run-input=v1,v2,...  Run prediction first (for get-output)\n");
+    printf("  --type=TYPE            Histogram type: activation or gradient (default: activation)\n");
+    printf("  --run-input=v1,v2,...  Input values for get-output/layer-info/histogram (optional)\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  mlpcuda create --input=2 --hidden=4,4 --output=1 --save=xor.bin\n");
-    printf("  mlpcuda train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin\n");
-    printf("  mlpcuda predict --model=xor_trained.bin --input=1,0\n");
-    printf("  mlpcuda info --model=xor_trained.bin\n");
-    printf("\n");
-    printf("Facade Examples:\n");
-    printf("  mlpcuda get-weight --model=m.bin --layer=1 --neuron=0 --weight=2\n");
-    printf("  mlpcuda set-weight --model=m.bin --layer=1 --neuron=0 --weight=2 --value=0.5 --save=m.bin\n");
-    printf("  mlpcuda get-weights --model=m.bin --layer=1 --neuron=0\n");
-    printf("  mlpcuda get-bias --model=m.bin --layer=1 --neuron=0\n");
-    printf("  mlpcuda get-output --model=m.bin --layer=1 --run-input=1,0\n");
-    printf("  mlpcuda layer-info --model=m.bin --layer=1\n");
-    printf("  mlpcuda histogram --model=m.bin --layer=1 --type=activation --run-input=1,0\n");
-    printf("  mlpcuda get-optimizer --model=m.bin --layer=1 --neuron=0 --weight=0\n");
+    printf("  facaded_mlp_cuda create --input=2 --hidden=8 --output=1 --save=xor.bin\n");
+    printf("  facaded_mlp_cuda train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin\n");
+    printf("  facaded_mlp_cuda predict --model=xor_trained.bin --input=1,0\n");
+    printf("  facaded_mlp_cuda info --model=xor_trained.bin\n");
+    printf("  facaded_mlp_cuda get-weight --model=xor.bin --layer=0 --neuron=0 --weight=0\n");
+    printf("  facaded_mlp_cuda set-weight --model=xor.bin --layer=0 --neuron=0 --weight=0 --value=0.5 --save=xor_mod.bin\n");
+    printf("  facaded_mlp_cuda get-output --model=xor.bin --layer=1 --neuron=0 --run-input=1,0\n");
+    printf("  facaded_mlp_cuda layer-info --model=xor.bin --layer=1 --run-input=1,0\n");
+    printf("  facaded_mlp_cuda histogram --model=xor.bin --layer=1 --type=activation --run-input=1,0\n");
 }
 
 int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
-
+    
+    // Show help if no arguments provided or if --help is the first argument
     if (argc < 2) {
         PrintUsage();
         return 0;
