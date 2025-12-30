@@ -41,8 +41,6 @@ GlassBoxAI-MLP is a transparent, research-grade multi-layer perceptron (MLP) too
 
 ## Module Overview
 
-There are **2 x 2 = 4 modes**:
-
 | Type      | Core CLI Model      | Facade/Introspectable   |
 |-----------|---------------------|-------------------------|
 | CUDA      | `mlp.cu`            | `facaded_mlp.cu`        |
