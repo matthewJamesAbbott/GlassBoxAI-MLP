@@ -1,75 +1,26 @@
-//
-// MLPCuda - CUDA Command-line Multi-Layer Perceptron with Full Facade
-// CLI: Create, Train, Predict, Inspect, and Directly Modify Model Internals
-// Matches and extends the Pascal MLPFacade interface
-//
-// Matthew Abbott 2025
-//
-// Compile:
-//   nvcc -o facaded_mlp_cuda facaded_mlp_cuda.cu -lcurand
-//
-// Usage (commands):
-//   facaded_mlp_cuda create --input=N --hidden=N,N,... --output=N [options] --save=FILE
-//   facaded_mlp_cuda train --model=FILE --data=FILE [options] --save=FILE
-//   facaded_mlp_cuda predict --model=FILE --input=v1,v2,...
-//   facaded_mlp_cuda info --model=FILE
-//   facaded_mlp_cuda get-weight --model=FILE --layer=L --neuron=N --weight=W
-//   facaded_mlp_cuda set-weight --model=FILE --layer=L --neuron=N --weight=W --value=V --save=FILE
-//   facaded_mlp_cuda get-weights --model=FILE --layer=L --neuron=N
-//   facaded_mlp_cuda get-bias --model=FILE --layer=L --neuron=N
-//   facaded_mlp_cuda set-bias --model=FILE --layer=L --neuron=N --value=V --save=FILE
-//   facaded_mlp_cuda get-output --model=FILE --layer=L --neuron=N [--run-input=v1,v2,...]
-//   facaded_mlp_cuda get-error --model=FILE --layer=L --neuron=N
-//   facaded_mlp_cuda layer-info --model=FILE --layer=L [--run-input=v1,v2,...]
-//   facaded_mlp_cuda histogram --model=FILE --layer=L [--bins=N] [--type=activation|gradient] [--run-input=v1,v2,...]
-//   facaded_mlp_cuda get-optimizer --model=FILE --layer=L --neuron=N [--weight=W]
-//   facaded_mlp_cuda help
-//
-// Standard Options:
-//   --input=N                  Input layer size (create) or input values (predict/get-output)
-//   --hidden=N,N,...           Hidden layer sizes (comma-separated, required for create)
-//   --output=N                 Output layer size (required for create)
-//   --save=FILE                Save model to file (required for create/train/set-*)
-//   --model=FILE               Model file to load
-//   --data=FILE                Training data CSV file
-//   --lr=VALUE                 Learning rate (default: 0.1)
-//   --optimizer=TYPE           sgd|adam|rmsprop (default: sgd)
-//   --hidden-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
-//   --output-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)
-//   --dropout=VALUE            Dropout rate 0-1 (default: 0)
-//   --l2=VALUE                 L2 regularization (default: 0)
-//   --beta1=VALUE              Adam beta1 (default: 0.9)
-//   --beta2=VALUE              Adam beta2 (default: 0.999)
-//   --epochs=N                 Training epochs (default: 100)
-//   --batch=N                  Training batch size (default: 1)
-//   --lr-decay                 Enable learning rate decay
-//   --lr-decay-rate=VALUE      Learning rate decay rate (default: 0.95)
-//   --lr-decay-epochs=N        Iterations between learning rate decay (default: 10)
-//   --early-stop               Enable early stopping
-//   --patience=N               Early stopping patience (default: 10)
-//   --normalize                Normalize input data before training
-//   --verbose                  Show training progress
-//
-// Facade Options:
-//   --layer=L                  Layer index for facade commands
-//   --neuron=N                 Neuron index for facade commands
-//   --weight=W                 Weight index for facade commands (within neuron)
-//   --value=V                  Value for set-* commands
-//   --bins=N                   Number of histogram bins (default: 20)
-//   --type=TYPE                Histogram type: activation|gradient (default: activation)
-//   --run-input=v1,v2,...      Input values for get-output/layer-info/histogram (optional)
-//
-// Examples:
-//   facaded_mlp_cuda create --input=2 --hidden=8 --output=1 --save=xor.bin
-//   facaded_mlp_cuda train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin
-//   facaded_mlp_cuda predict --model=xor_trained.bin --input=1,0
-//   facaded_mlp_cuda info --model=xor_trained.bin
-//   facaded_mlp_cuda get-weight --model=xor.bin --layer=0 --neuron=0 --weight=0
-//   facaded_mlp_cuda set-weight --model=xor.bin --layer=0 --neuron=0 --weight=0 --value=0.5 --save=xor_mod.bin
-//   facaded_mlp_cuda get-output --model=xor.bin --layer=1 --neuron=0 --run-input=1,0
-//   facaded_mlp_cuda layer-info --model=xor.bin --layer=1 --run-input=1,0
-//   facaded_mlp_cuda histogram --model=xor.bin --layer=1 --type=activation --run-input=1,0
-//
+/*
+ * MIT License
+ *
+ * Copyright (c) 2025 Matthew Abbott
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 
 #include <cuda_runtime.h>
 #include <curand.h>
@@ -83,6 +34,7 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 
 #define CUDA_CHECK(call) \
     do { \
@@ -608,149 +560,282 @@ public:
     }
 
     bool Save(const char* filename) {
-        FILE* f = fopen(filename, "wb");
+        std::ofstream f(filename);
         if (!f) return false;
-
-        fwrite(MODEL_MAGIC, 1, 8, f);
-        fwrite(&FInputSize, sizeof(int), 1, f);
-        fwrite(&FOutputSize, sizeof(int), 1, f);
-        int numHidden = FHiddenSizes.size();
-        fwrite(&numHidden, sizeof(int), 1, f);
-        fwrite(FHiddenSizes.data(), sizeof(int), numHidden, f);
-
-        fwrite(&LearningRate, sizeof(double), 1, f);
-        int opt = (int)Optimizer;
-        fwrite(&opt, sizeof(int), 1, f);
-        int hidAct = (int)HiddenActivation;
-        fwrite(&hidAct, sizeof(int), 1, f);
-        int outAct = (int)OutputActivation;
-        fwrite(&outAct, sizeof(int), 1, f);
-        fwrite(&DropoutRate, sizeof(double), 1, f);
-        fwrite(&L2Lambda, sizeof(double), 1, f);
-        fwrite(&Beta1, sizeof(double), 1, f);
-        fwrite(&Beta2, sizeof(double), 1, f);
-        fwrite(&Timestep, sizeof(int), 1, f);
-        fwrite(&EnableLRDecay, sizeof(bool), 1, f);
-        fwrite(&LRDecayRate, sizeof(double), 1, f);
-        fwrite(&LRDecayEpochs, sizeof(int), 1, f);
-        fwrite(&EnableEarlyStopping, sizeof(bool), 1, f);
-        fwrite(&EarlyStoppingPatience, sizeof(int), 1, f);
-
-        for (int k = 0; k < NumLayers; k++) {
-            LayerData& layer = h_Layers[k];
-            int weightSize = layer.NumNeurons * layer.NumInputs;
-
-            double* h_weights = new double[weightSize];
+        
+        f << "{\n";
+        f << "  \"magic\": \"" << MODEL_MAGIC << "\",\n";
+        f << "  \"input_size\": " << FInputSize << ",\n";
+        f << "  \"output_size\": " << FOutputSize << ",\n";
+        f << "  \"hidden_sizes\": [";
+        for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+            if (i > 0) f << ",";
+            f << FHiddenSizes[i];
+        }
+        f << "],\n";
+        f << std::fixed << std::setprecision(6);
+        f << "  \"learning_rate\": " << LearningRate << ",\n";
+        f << "  \"optimizer\": " << (int)Optimizer << ",\n";
+        f << "  \"hidden_activation\": " << (int)HiddenActivation << ",\n";
+        f << "  \"output_activation\": " << (int)OutputActivation << ",\n";
+        f << std::setprecision(4);
+        f << "  \"dropout_rate\": " << DropoutRate << ",\n";
+        f << std::setprecision(6);
+        f << "  \"l2_lambda\": " << L2Lambda << ",\n";
+        f << "  \"beta1\": " << Beta1 << ",\n";
+        f << "  \"beta2\": " << Beta2 << ",\n";
+        
+        f << "  \"input_layer\": {\n";
+        f << "    \"neuron_count\": " << FInputSize << "\n";
+        f << "  },\n";
+        
+        f << "  \"hidden_layers\": [\n";
+        for (size_t h = 0; h < FHiddenSizes.size(); h++) {
+            LayerData& layer = h_Layers[h + 1];
+            int numNeurons = FHiddenSizes[h];
+            int numInputs = (h == 0) ? FInputSize : FHiddenSizes[h-1];
+            
+            double* h_weights = new double[layer.NumNeurons * layer.NumInputs];
             double* h_biases = new double[layer.NumNeurons];
-            double* h_M = new double[weightSize];
-            double* h_V = new double[weightSize];
-            double* h_MBias = new double[layer.NumNeurons];
-            double* h_VBias = new double[layer.NumNeurons];
-
-            CUDA_CHECK(cudaMemcpy(h_weights, layer.Weights, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_weights, layer.Weights, layer.NumNeurons * layer.NumInputs * sizeof(double), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_biases, layer.Biases, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_M, layer.M, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_V, layer.V, weightSize * sizeof(double), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_MBias, layer.MBias, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_VBias, layer.VBias, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
-
-            fwrite(h_weights, sizeof(double), weightSize, f);
-            fwrite(h_biases, sizeof(double), layer.NumNeurons, f);
-            fwrite(h_M, sizeof(double), weightSize, f);
-            fwrite(h_V, sizeof(double), weightSize, f);
-            fwrite(h_MBias, sizeof(double), layer.NumNeurons, f);
-            fwrite(h_VBias, sizeof(double), layer.NumNeurons, f);
-
+            
+            f << "    {\n";
+            f << "      \"neuron_count\": " << numNeurons << ",\n";
+            f << "      \"neurons\": [\n";
+            for (int j = 0; j < numNeurons; j++) {
+                f << "        {\n";
+                f << "          \"weights\": [";
+                for (int w = 0; w < numInputs; w++) {
+                    if (w > 0) f << ",";
+                    f << std::fixed << std::setprecision(10) << h_weights[j * layer.NumInputs + w];
+                }
+                f << "],\n";
+                f << std::setprecision(10);
+                f << "          \"bias\": " << h_biases[j] << "\n";
+                f << "        }";
+                if (j < numNeurons - 1) f << ",";
+                f << "\n";
+            }
+            f << "      ],\n";
+            f << "      \"biases\": [";
+            for (int j = 0; j < numNeurons; j++) {
+                if (j > 0) f << ",";
+                f << std::fixed << std::setprecision(10) << h_biases[j];
+            }
+            f << "]\n";
+            f << "    }";
+            if (h < FHiddenSizes.size() - 1) f << ",";
+            f << "\n";
+            
             delete[] h_weights;
             delete[] h_biases;
-            delete[] h_M;
-            delete[] h_V;
-            delete[] h_MBias;
-            delete[] h_VBias;
         }
-
-        fclose(f);
+        f << "  ],\n";
+        
+        LayerData& outLayer = h_Layers[NumLayers - 1];
+        int outNumInputs = FHiddenSizes.empty() ? FInputSize : FHiddenSizes.back();
+        
+        double* h_weights = new double[outLayer.NumNeurons * outLayer.NumInputs];
+        double* h_biases = new double[outLayer.NumNeurons];
+        CUDA_CHECK(cudaMemcpy(h_weights, outLayer.Weights, outLayer.NumNeurons * outLayer.NumInputs * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_biases, outLayer.Biases, outLayer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+        
+        f << "  \"output_layer\": {\n";
+        f << "    \"neuron_count\": " << FOutputSize << ",\n";
+        f << "    \"neurons\": [\n";
+        for (int i = 0; i < FOutputSize; i++) {
+            f << "      {\n";
+            f << "        \"weights\": [";
+            for (int w = 0; w < outNumInputs; w++) {
+                if (w > 0) f << ",";
+                f << std::fixed << std::setprecision(10) << h_weights[i * outLayer.NumInputs + w];
+            }
+            f << "],\n";
+            f << std::setprecision(10);
+            f << "        \"bias\": " << h_biases[i] << "\n";
+            f << "      }";
+            if (i < FOutputSize - 1) f << ",";
+            f << "\n";
+        }
+        f << "    ],\n";
+        f << "    \"biases\": [";
+        for (int i = 0; i < FOutputSize; i++) {
+            if (i > 0) f << ",";
+            f << std::fixed << std::setprecision(10) << h_biases[i];
+        }
+        f << "]\n";
+        f << "  }\n";
+        f << "}\n";
+        
+        delete[] h_weights;
+        delete[] h_biases;
+        f.close();
         return true;
     }
 
     static TMultiLayerPerceptronCUDA* Load(const char* filename) {
-        FILE* f = fopen(filename, "rb");
-        if (!f) return nullptr;
-
-        char magic[9] = {0};
-        fread(magic, 1, 8, f);
-        if (strcmp(magic, MODEL_MAGIC) != 0) {
-            fclose(f);
-            return nullptr;
+        std::ifstream f(filename);
+        if (!f.is_open()) return nullptr;
+        
+        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        f.close();
+        
+        auto getJsonNumber = [&](const std::string& key) -> double {
+            size_t pos = content.find("\"" + key + "\"");
+            if (pos == std::string::npos) return 0.0;
+            size_t colonPos = content.find(":", pos);
+            size_t nextComma = content.find(",", colonPos);
+            size_t nextBracket = content.find("}", colonPos);
+            size_t endPos = (nextComma < nextBracket) ? nextComma : nextBracket;
+            std::string value = content.substr(colonPos + 1, endPos - colonPos - 1);
+            while (!value.empty() && (value[0] == ' ' || value[0] == '\t' || value[0] == '\n')) value.erase(0, 1);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\n')) value.pop_back();
+            try { return std::stod(value); } catch (...) { return 0.0; }
+        };
+        
+        auto getJsonInt = [&](const std::string& key) -> int {
+            return (int)getJsonNumber(key);
+        };
+        
+        auto parseArray = [&](const std::string& jsonStr) -> std::vector<double> {
+            std::vector<double> result;
+            size_t start = jsonStr.find('[');
+            size_t end = jsonStr.find(']');
+            if (start == std::string::npos || end == std::string::npos) return result;
+            std::string arrayContent = jsonStr.substr(start + 1, end - start - 1);
+            std::stringstream ss(arrayContent);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                while (!token.empty() && (token[0] == ' ' || token[0] == '\t' || token[0] == '\n')) token.erase(0, 1);
+                while (!token.empty() && (token.back() == ' ' || token.back() == '\t' || token.back() == '\n')) token.pop_back();
+                if (!token.empty()) {
+                    try { result.push_back(std::stod(token)); } catch (...) {}
+                }
+            }
+            return result;
+        };
+        
+        int newInputSize = getJsonInt("input_size");
+        int newOutputSize = getJsonInt("output_size");
+        TActivationType newHiddenAct = (TActivationType)getJsonInt("hidden_activation");
+        TActivationType newOutputAct = (TActivationType)getJsonInt("output_activation");
+        double newLR = getJsonNumber("learning_rate");
+        TOptimizerType newOpt = (TOptimizerType)getJsonInt("optimizer");
+        double newDropout = getJsonNumber("dropout_rate");
+        double newL2 = getJsonNumber("l2_lambda");
+        double newBeta1 = getJsonNumber("beta1");
+        double newBeta2 = getJsonNumber("beta2");
+        
+        std::vector<int> newHiddenSizes;
+        size_t hiddenArrayPos = content.find("\"hidden_sizes\"");
+        if (hiddenArrayPos != std::string::npos) {
+            size_t startBracket = content.find("[", hiddenArrayPos);
+            size_t endBracket = content.find("]", startBracket);
+            std::string arrayContent = content.substr(startBracket + 1, endBracket - startBracket - 1);
+            std::stringstream ss(arrayContent);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                while (!token.empty() && (token[0] == ' ' || token[0] == '\t' || token[0] == '\n')) token.erase(0, 1);
+                while (!token.empty() && (token.back() == ' ' || token.back() == '\t' || token.back() == '\n')) token.pop_back();
+                if (!token.empty()) {
+                    try { newHiddenSizes.push_back(std::stoi(token)); } catch (...) {}
+                }
+            }
         }
-
-        int inputSize, outputSize, numHidden;
-        fread(&inputSize, sizeof(int), 1, f);
-        fread(&outputSize, sizeof(int), 1, f);
-        fread(&numHidden, sizeof(int), 1, f);
-
-        std::vector<int> hiddenSizes(numHidden);
-        fread(hiddenSizes.data(), sizeof(int), numHidden, f);
-
-        double learningRate;
-        int opt, hidAct, outAct;
-        fread(&learningRate, sizeof(double), 1, f);
-        fread(&opt, sizeof(int), 1, f);
-        fread(&hidAct, sizeof(int), 1, f);
-        fread(&outAct, sizeof(int), 1, f);
-
+        
+        if (newInputSize <= 0 || newOutputSize <= 0 || newHiddenSizes.empty()) return nullptr;
+        
         TMultiLayerPerceptronCUDA* mlp = new TMultiLayerPerceptronCUDA(
-            inputSize, hiddenSizes, outputSize, 
-            (TActivationType)hidAct, (TActivationType)outAct);
-
-        mlp->LearningRate = learningRate;
-        mlp->Optimizer = (TOptimizerType)opt;
-
-        fread(&mlp->DropoutRate, sizeof(double), 1, f);
-        fread(&mlp->L2Lambda, sizeof(double), 1, f);
-        fread(&mlp->Beta1, sizeof(double), 1, f);
-        fread(&mlp->Beta2, sizeof(double), 1, f);
-        fread(&mlp->Timestep, sizeof(int), 1, f);
-        fread(&mlp->EnableLRDecay, sizeof(bool), 1, f);
-        fread(&mlp->LRDecayRate, sizeof(double), 1, f);
-        fread(&mlp->LRDecayEpochs, sizeof(int), 1, f);
-        fread(&mlp->EnableEarlyStopping, sizeof(bool), 1, f);
-        fread(&mlp->EarlyStoppingPatience, sizeof(int), 1, f);
-
-        for (int k = 0; k < mlp->NumLayers; k++) {
-            LayerData& layer = mlp->h_Layers[k];
-            int weightSize = layer.NumNeurons * layer.NumInputs;
-
-            double* h_weights = new double[weightSize];
+            newInputSize, newHiddenSizes, newOutputSize, newHiddenAct, newOutputAct);
+        mlp->LearningRate = newLR;
+        mlp->Optimizer = newOpt;
+        mlp->DropoutRate = newDropout;
+        mlp->L2Lambda = newL2;
+        mlp->Beta1 = newBeta1;
+        mlp->Beta2 = newBeta2;
+        
+        size_t searchPos = 0;
+        size_t hiddenStart = content.find("\"hidden_layers\"");
+        size_t hiddenEnd = content.find("\"output_layer\"");
+        if (hiddenStart != std::string::npos && hiddenEnd != std::string::npos) {
+            searchPos = hiddenStart;
+            for (size_t h = 0; h < newHiddenSizes.size(); h++) {
+                LayerData& layer = mlp->h_Layers[h + 1];
+                int layerNeurons = newHiddenSizes[h];
+                int layerInputs = (h == 0) ? newInputSize : newHiddenSizes[h-1];
+                
+                double* h_weights = new double[layer.NumNeurons * layer.NumInputs];
+                double* h_biases = new double[layer.NumNeurons];
+                memset(h_weights, 0, layer.NumNeurons * layer.NumInputs * sizeof(double));
+                memset(h_biases, 0, layer.NumNeurons * sizeof(double));
+                
+                for (int n = 0; n < layerNeurons; n++) {
+                    size_t wPos = content.find("\"weights\": [", searchPos);
+                    if (wPos != std::string::npos && wPos < hiddenEnd) {
+                        size_t wEnd = content.find("]", wPos);
+                        std::string weightsStr = content.substr(wPos, wEnd - wPos + 1);
+                        std::vector<double> weights = parseArray(weightsStr);
+                        for (size_t w = 0; w < weights.size() && w < (size_t)layerInputs; w++) {
+                            h_weights[n * layer.NumInputs + w] = weights[w];
+                        }
+                        searchPos = wEnd + 1;
+                    }
+                    size_t bPos = content.find("\"bias\": ", searchPos);
+                    if (bPos != std::string::npos && bPos < hiddenEnd) {
+                        size_t bEnd = content.find_first_of(",}", bPos + 8);
+                        std::string biasStr = content.substr(bPos + 8, bEnd - bPos - 8);
+                        while (!biasStr.empty() && (biasStr[0] == ' ' || biasStr[0] == '\t' || biasStr[0] == '\n')) biasStr.erase(0, 1);
+                        while (!biasStr.empty() && (biasStr.back() == ' ' || biasStr.back() == '\t' || biasStr.back() == '\n')) biasStr.pop_back();
+                        try { h_biases[n] = std::stod(biasStr); } catch (...) {}
+                        searchPos = bEnd + 1;
+                    }
+                }
+                CUDA_CHECK(cudaMemcpy(layer.Weights, h_weights, layer.NumNeurons * layer.NumInputs * sizeof(double), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(layer.Biases, h_biases, layer.NumNeurons * sizeof(double), cudaMemcpyHostToDevice));
+                delete[] h_weights;
+                delete[] h_biases;
+            }
+        }
+        
+        size_t outputStart = content.find("\"output_layer\"");
+        if (outputStart != std::string::npos) {
+            searchPos = outputStart;
+            LayerData& layer = mlp->h_Layers[mlp->NumLayers - 1];
+            int layerInputs = newHiddenSizes.empty() ? newInputSize : newHiddenSizes.back();
+            
+            double* h_weights = new double[layer.NumNeurons * layer.NumInputs];
             double* h_biases = new double[layer.NumNeurons];
-            double* h_M = new double[weightSize];
-            double* h_V = new double[weightSize];
-            double* h_MBias = new double[layer.NumNeurons];
-            double* h_VBias = new double[layer.NumNeurons];
-
-            fread(h_weights, sizeof(double), weightSize, f);
-            fread(h_biases, sizeof(double), layer.NumNeurons, f);
-            fread(h_M, sizeof(double), weightSize, f);
-            fread(h_V, sizeof(double), weightSize, f);
-            fread(h_MBias, sizeof(double), layer.NumNeurons, f);
-            fread(h_VBias, sizeof(double), layer.NumNeurons, f);
-
-            CUDA_CHECK(cudaMemcpy(layer.Weights, h_weights, weightSize * sizeof(double), cudaMemcpyHostToDevice));
+            memset(h_weights, 0, layer.NumNeurons * layer.NumInputs * sizeof(double));
+            memset(h_biases, 0, layer.NumNeurons * sizeof(double));
+            
+            for (int n = 0; n < newOutputSize; n++) {
+                size_t wPos = content.find("\"weights\": [", searchPos);
+                if (wPos != std::string::npos) {
+                    size_t wEnd = content.find("]", wPos);
+                    std::string weightsStr = content.substr(wPos, wEnd - wPos + 1);
+                    std::vector<double> weights = parseArray(weightsStr);
+                    for (size_t w = 0; w < weights.size() && w < (size_t)layerInputs; w++) {
+                        h_weights[n * layer.NumInputs + w] = weights[w];
+                    }
+                    searchPos = wEnd + 1;
+                }
+                size_t bPos = content.find("\"bias\": ", searchPos);
+                if (bPos != std::string::npos) {
+                    size_t bEnd = content.find_first_of(",}", bPos + 8);
+                    std::string biasStr = content.substr(bPos + 8, bEnd - bPos - 8);
+                    while (!biasStr.empty() && (biasStr[0] == ' ' || biasStr[0] == '\t' || biasStr[0] == '\n')) biasStr.erase(0, 1);
+                    while (!biasStr.empty() && (biasStr.back() == ' ' || biasStr.back() == '\t' || biasStr.back() == '\n')) biasStr.pop_back();
+                    try { h_biases[n] = std::stod(biasStr); } catch (...) {}
+                    searchPos = bEnd + 1;
+                }
+            }
+            CUDA_CHECK(cudaMemcpy(layer.Weights, h_weights, layer.NumNeurons * layer.NumInputs * sizeof(double), cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(layer.Biases, h_biases, layer.NumNeurons * sizeof(double), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(layer.M, h_M, weightSize * sizeof(double), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(layer.V, h_V, weightSize * sizeof(double), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(layer.MBias, h_MBias, layer.NumNeurons * sizeof(double), cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(layer.VBias, h_VBias, layer.NumNeurons * sizeof(double), cudaMemcpyHostToDevice));
-
             delete[] h_weights;
             delete[] h_biases;
-            delete[] h_M;
-            delete[] h_V;
-            delete[] h_MBias;
-            delete[] h_VBias;
         }
-
-        fclose(f);
+        
         return mlp;
     }
 
@@ -1318,7 +1403,7 @@ int main(int argc, char** argv) {
 
         mlp->Save(saveFile.c_str());
 
-        printf("Created CUDA MLP model (GPU: %s):\n", prop.name);
+        printf("Created MLP model (GPU: %s):\n", prop.name);
         printf("  Input size: %d\n", inputSize);
         printf("  Hidden sizes: ");
         for (size_t i = 0; i < hiddenSizes.size(); i++)
@@ -1437,6 +1522,11 @@ int main(int argc, char** argv) {
         printf("Input size: %d\n", mlp->GetInputSize());
         printf("Output size: %d\n", mlp->GetOutputSize());
         printf("Hidden layers: %d\n", mlp->GetHiddenLayerCount());
+        printf("Hidden sizes: ");
+        const std::vector<int>& hs = mlp->GetHiddenSizes();
+        for (size_t i = 0; i < hs.size(); i++)
+            printf("%s%d", i > 0 ? "," : "", hs[i]);
+        printf("\n");
         printf("Layer sizes: %d", mlp->GetInputSize());
         for (int h : mlp->GetHiddenSizes())
             printf(" -> %d", h);
