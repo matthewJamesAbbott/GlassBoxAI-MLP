@@ -54,7 +54,7 @@ enum TOptimizerType { otSGD = 0, otAdam = 1, otRMSProp = 2 };
 enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp,
                 cmdGetWeight, cmdSetWeight, cmdGetBias, cmdSetBias,
                 cmdGetOutput, cmdGetError, cmdLayerInfo, cmdHistogram,
-                cmdGetOptimizer, cmdGetWeights, cmdGetAllOutputs };
+                cmdGetOptimizer, cmdGetWeights, cmdGetAllOutputs, cmdBatchPredict };
 
 // Device functions
 __device__ double d_Sigmoid(double x) {
@@ -1185,80 +1185,87 @@ int MaxIndex(const double* arr, int n) {
 }
 
 void PrintUsage() {
-    printf("Facaded MLP CUDA - Command-line Multi-Layer Perceptron (w/ Facade)\n");
+    printf("Facaded MLP\n");
+    printf("\n");
+    printf("Usage: facaded_mlp <command> [options]\n");
     printf("\n");
     printf("Commands:\n");
     printf("  create         Create a new MLP model\n");
     printf("  train          Train an existing model with data\n");
     printf("  predict        Make predictions with a trained model\n");
+    printf("  batch-predict  Make predictions with a trained model (batch)\n");
     printf("  info           Display model information\n");
-    printf("  get-weight     Get a single weight value\n");
-    printf("  set-weight     Set a single weight value\n");
-    printf("  get-weights    Get all weights for a neuron\n");
-    printf("  get-bias       Get bias value for a neuron\n");
-    printf("  set-bias       Set bias value for a neuron\n");
-    printf("  get-output     Get neuron output value\n");
-    printf("  get-error      Get neuron error value\n");
-    printf("  layer-info     Display layer information\n");
-    printf("  histogram      Display activation or gradient histogram\n");
-    printf("  get-optimizer  Get optimizer state values (M, V for Adam/RMSProp)\n");
+    printf("  get-weight     Get a single weight value (FACADE)\n");
+    printf("  set-weight     Set a single weight value (FACADE)\n");
+    printf("  get-weights    Get all weights for a neuron (FACADE)\n");
+    printf("  get-bias       Get bias value for a neuron (FACADE)\n");
+    printf("  set-bias       Set bias value for a neuron (FACADE)\n");
+    printf("  get-output     Get neuron output value (FACADE)\n");
+    printf("  get-error      Get neuron error value (FACADE)\n");
+    printf("  layer-info     Display layer information (FACADE)\n");
+    printf("  histogram      Display activation or error histogram (FACADE)\n");
+    printf("  get-optimizer  Get optimizer state values M, V (FACADE)\n");
     printf("  help           Show this help message\n");
     printf("\n");
     printf("Create Options:\n");
-    printf("  --input=N              Input layer size (required)\n");
-    printf("  --hidden=N,N,...       Hidden layer sizes (required)\n");
-    printf("  --output=N             Output layer size (required)\n");
-    printf("  --save=FILE            Save model to file (required)\n");
-    printf("  --lr=VALUE             Learning rate (default: 0.1)\n");
-    printf("  --optimizer=TYPE       sgd|adam|rmsprop (default: sgd)\n");
-    printf("  --hidden-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
-    printf("  --output-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)\n");
-    printf("  --dropout=VALUE        Dropout rate 0-1 (default: 0)\n");
-    printf("  --l2=VALUE             L2 regularization (default: 0)\n");
-    printf("  --beta1=VALUE          Adam beta1 (default: 0.9)\n");
-    printf("  --beta2=VALUE          Adam beta2 (default: 0.999)\n");
+    printf("  -i, --input=N              Input layer size (required)\n");
+    printf("  -H, --hidden=N,N,...       Hidden layer sizes (required)\n");
+    printf("  -o, --output=N             Output layer size (required)\n");
+    printf("  -s, --save=FILE            Save model to file (required)\n");
+    printf("  --lr=VALUE                 Learning rate (default: 0.1)\n");
+    printf("  --optimizer=TYPE           sgd|adam|rmsprop (default: sgd)\n");
+    printf("  --hidden-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)\n");
+    printf("  --output-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)\n");
+    printf("  --dropout=VALUE            Dropout rate 0-1 (default: 0)\n");
+    printf("  --l2=VALUE                 L2 regularization (default: 0)\n");
+    printf("  --beta1=VALUE              Adam beta1 (default: 0.9)\n");
+    printf("  --beta2=VALUE              Adam beta2 (default: 0.999)\n");
     printf("\n");
     printf("Train Options:\n");
-    printf("  --model=FILE           Model file to load (required)\n");
-    printf("  --data=FILE            Training data CSV file (required)\n");
-    printf("  --save=FILE            Save trained model to file (required)\n");
-    printf("  --epochs=N             Number of training epochs (default: 100)\n");
-    printf("  --batch=N              Batch size (default: 1)\n");
-    printf("  --lr=VALUE             Override learning rate\n");
-    printf("  --lr-decay             Enable learning rate decay\n");
-    printf("  --lr-decay-rate=VALUE  LR decay rate (default: 0.95)\n");
-    printf("  --lr-decay-epochs=N    Epochs between decay (default: 10)\n");
-    printf("  --early-stop           Enable early stopping\n");
-    printf("  --patience=N           Early stopping patience (default: 10)\n");
-    printf("  --normalize            Normalize input data\n");
-    printf("  --verbose              Show training progress\n");
+    printf("  -m, --model=FILE           Load model from file (required)\n");
+    printf("  -d, --data=FILE            Training data CSV file (required)\n");
+    printf("  -s, --save=FILE            Save trained model to file (required)\n");
+    printf("  --epochs=N                 Number of training epochs (default: 100)\n");
+    printf("  --batch=N                  Batch size (default: 1)\n");
+    printf("  --lr=VALUE                 Override learning rate\n");
+    printf("  --lr-decay                 Enable learning rate decay\n");
+    printf("  --lr-decay-rate=VALUE      LR decay rate (default: 0.95)\n");
+    printf("  --lr-decay-epochs=N        Epochs between decay (default: 10)\n");
+    printf("  --early-stop               Enable early stopping\n");
+    printf("  --patience=N               Early stopping patience (default: 10)\n");
+    printf("  --normalize                Normalize input data\n");
+    printf("  --verbose                  Show training progress\n");
     printf("\n");
     printf("Predict Options:\n");
-    printf("  --model=FILE           Model file to load (required)\n");
-    printf("  --input=v1,v2,...      Input values (required)\n");
+    printf("  -m, --model=FILE           Model file to load (required)\n");
+    printf("  -i, --input=v1,v2,...      Input values (required)\n");
     printf("\n");
     printf("Info Options:\n");
-    printf("  --model=FILE           Model file to load (required)\n");
+    printf("  -m, --model=FILE           Model file to load (required)\n");
     printf("\n");
-    printf("Facade Options:\n");
-    printf("  --layer=L              Layer index (required for facade commands)\n");
-    printf("  --neuron=N             Neuron index (required for most facade commands)\n");
-    printf("  --weight=W             Weight index within neuron (for weight commands)\n");
-    printf("  --value=V              Value to set (required for set-* commands)\n");
-    printf("  --bins=N               Number of histogram bins (default: 20)\n");
-    printf("  --type=TYPE            Histogram type: activation or gradient (default: activation)\n");
-    printf("  --run-input=v1,v2,...  Input values for get-output/layer-info/histogram (optional)\n");
+    printf("Facade Options (for get/set commands):\n");
+    printf("  -m, --model=FILE           Model file (required)\n");
+    printf("  --layer=L                  Layer index (required)\n");
+    printf("  --neuron=N                 Neuron index (required)\n");
+    printf("  --weight=W                 Weight index within neuron\n");
+    printf("  --value=V                  Value to set (required for set-* commands)\n");
+    printf("  -s, --save=FILE            Save modified model to file (required for set-* commands)\n");
+    printf("  --bins=N                   Number of histogram bins (default: 20)\n");
+    printf("  --type=TYPE                Histogram type: activation|error (default: activation)\n");
+    printf("  -i, --input=v1,v2,...      Input values for get-output command\n");
     printf("\n");
     printf("Examples:\n");
-    printf("  facaded_mlp_cuda create --input=2 --hidden=8 --output=1 --save=xor.bin\n");
-    printf("  facaded_mlp_cuda train --model=xor.bin --data=xor.csv --epochs=1000 --save=xor_trained.bin\n");
-    printf("  facaded_mlp_cuda predict --model=xor_trained.bin --input=1,0\n");
-    printf("  facaded_mlp_cuda info --model=xor_trained.bin\n");
-    printf("  facaded_mlp_cuda get-weight --model=xor.bin --layer=0 --neuron=0 --weight=0\n");
-    printf("  facaded_mlp_cuda set-weight --model=xor.bin --layer=0 --neuron=0 --weight=0 --value=0.5 --save=xor_mod.bin\n");
-    printf("  facaded_mlp_cuda get-output --model=xor.bin --layer=1 --neuron=0 --run-input=1,0\n");
-    printf("  facaded_mlp_cuda layer-info --model=xor.bin --layer=1 --run-input=1,0\n");
-    printf("  facaded_mlp_cuda histogram --model=xor.bin --layer=1 --type=activation --run-input=1,0\n");
+    printf("  facaded_mlp create -i 2 -H 8 -o 1 -s xor.json\n");
+    printf("  facaded_mlp train -m xor.json -d data.csv -s xor_trained.json --epochs=1000\n");
+    printf("  facaded_mlp predict -m xor_trained.json -i 1,0\n");
+    printf("  facaded_mlp batch-predict -m xor_trained.json -i 1,0\n");
+    printf("  facaded_mlp info -m xor_trained.json\n");
+    printf("  facaded_mlp get-weight -m xor.json --layer=1 --neuron=0 --weight=0\n");
+    printf("  facaded_mlp set-weight -m xor.json --layer=1 --neuron=0 --weight=0 --value=0.5 -s xor_mod.json\n");
+    printf("  facaded_mlp layer-info -m xor.json --layer=0\n");
+    printf("  facaded_mlp histogram -m xor.json --layer=1 --bins=30 --type=activation\n");
+    printf("  facaded_mlp get-output -m xor.json --layer=0 --neuron=3 -i 1,0\n");
+    printf("  facaded_mlp get-optimizer -m xor.json --layer=1 --neuron=0\n");
 }
 
 int main(int argc, char** argv) {
@@ -1275,6 +1282,7 @@ int main(int argc, char** argv) {
     if (cmdStr == "create") command = cmdCreate;
     else if (cmdStr == "train") command = cmdTrain;
     else if (cmdStr == "predict") command = cmdPredict;
+    else if (cmdStr == "batch-predict") command = cmdBatchPredict;
     else if (cmdStr == "info") command = cmdInfo;
     else if (cmdStr == "help" || cmdStr == "--help" || cmdStr == "-h") command = cmdHelp;
     else if (cmdStr == "get-weight") command = cmdGetWeight;
@@ -1340,7 +1348,7 @@ int main(int argc, char** argv) {
         std::string value = arg.substr(eq + 1);
 
         if (key == "--input") {
-            if (command == cmdPredict)
+            if (command == cmdPredict || command == cmdBatchPredict)
                 inputValues = ParseDoubleArray(value.c_str());
             else
                 inputSize = atoi(value.c_str());
@@ -1479,6 +1487,38 @@ int main(int argc, char** argv) {
         delete mlp;
     }
     else if (command == cmdPredict) {
+        if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
+        if (inputValues.empty()) { printf("Error: --input is required\n"); return 1; }
+
+        TMultiLayerPerceptronCUDA* mlp = TMultiLayerPerceptronCUDA::Load(modelFile.c_str());
+        if (!mlp) { printf("Error: Failed to load model\n"); return 1; }
+
+        if ((int)inputValues.size() != mlp->GetInputSize()) {
+            printf("Error: Expected %d input values, got %zu\n", mlp->GetInputSize(), inputValues.size());
+            delete mlp;
+            return 1;
+        }
+
+        double* output = new double[mlp->GetOutputSize()];
+        mlp->Predict(inputValues.data(), output);
+
+        printf("Input: ");
+        for (size_t i = 0; i < inputValues.size(); i++)
+            printf("%s%.4f", i > 0 ? ", " : "", inputValues[i]);
+        printf("\n");
+
+        printf("Output: ");
+        for (int i = 0; i < mlp->GetOutputSize(); i++)
+            printf("%s%.6f", i > 0 ? ", " : "", output[i]);
+        printf("\n");
+
+        if (mlp->GetOutputSize() > 1)
+            printf("Max index: %d\n", MaxIndex(output, mlp->GetOutputSize()));
+
+        delete[] output;
+        delete mlp;
+    }
+    else if (command == cmdBatchPredict) {
         if (modelFile.empty()) { printf("Error: --model is required\n"); return 1; }
         if (inputValues.empty()) { printf("Error: --input is required\n"); return 1; }
 

@@ -43,7 +43,7 @@ enum TOptimizerType { otSGD, otAdam, otRMSProp };
 enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp,
                 cmdGetWeight, cmdSetWeight, cmdGetWeights, cmdGetBias, cmdSetBias,
                 cmdGetOutput, cmdGetError, cmdLayerInfo, cmdHistogram,
-                cmdGetOptimizer };
+                cmdGetOptimizer, cmdBatchPredict };
 
 // Type aliases
 typedef vector<double> Darray;
@@ -816,6 +816,7 @@ void PrintUsage() {
     cout << "  create         Create a new MLP model" << endl;
     cout << "  train          Train an existing model with data" << endl;
     cout << "  predict        Make predictions with a trained model" << endl;
+    cout << "  batch-predict  Make predictions with a trained model (batch)" << endl;
     cout << "  info           Display model information" << endl;
     cout << "  get-weight     Get a single weight value (FACADE)" << endl;
     cout << "  set-weight     Set a single weight value (FACADE)" << endl;
@@ -880,6 +881,7 @@ void PrintUsage() {
     cout << "  facaded_mlp create -i 2 -H 8 -o 1 -s xor.json" << endl;
     cout << "  facaded_mlp train -m xor.json -d data.csv -s xor_trained.json --epochs=1000" << endl;
     cout << "  facaded_mlp predict -m xor_trained.json -i 1,0" << endl;
+    cout << "  facaded_mlp batch-predict -m xor_trained.json -i 1,0" << endl;
     cout << "  facaded_mlp info -m xor_trained.json" << endl;
     cout << "  facaded_mlp get-weight -m xor.json --layer=1 --neuron=0 --weight=0" << endl;
     cout << "  facaded_mlp set-weight -m xor.json --layer=1 --neuron=0 --weight=0 --value=0.5 -s xor_mod.json" << endl;
@@ -901,6 +903,7 @@ int main(int argc, char* argv[]) {
     if (cmdStr == "create") command = cmdCreate;
     else if (cmdStr == "train") command = cmdTrain;
     else if (cmdStr == "predict") command = cmdPredict;
+    else if (cmdStr == "batch-predict") command = cmdBatchPredict;
     else if (cmdStr == "info") command = cmdInfo;
     else if (cmdStr == "get-weight") command = cmdGetWeight;
     else if (cmdStr == "set-weight") command = cmdSetWeight;
@@ -1005,7 +1008,7 @@ int main(int argc, char* argv[]) {
             
             // Process key-value pairs
             if (key == "--input" || key == "-i") {
-                if (command == cmdPredict || command == cmdGetOutput) {
+                if (command == cmdPredict || command == cmdBatchPredict || command == cmdGetOutput) {
                     if (value == "-") {
                         // Read from stdin
                         string line;
@@ -1190,6 +1193,43 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         else if (command == cmdPredict) {
+            if (modelFile.empty()) { cerr << "Error: --model is required" << endl; return 1; }
+            if (inputValues.empty()) { cerr << "Error: --input is required" << endl; return 1; }
+            
+            TMultiLayerPerceptron mlp(1, {1}, 1, atSigmoid, atSigmoid);
+            mlp.LoadModelFromJSON(modelFile);
+            
+            if ((int)inputValues.size() != mlp.GetInputSize()) {
+                cerr << "Error: Expected " << mlp.GetInputSize() << " input values, got " << inputValues.size() << endl;
+                return 1;
+            }
+            
+            Darray output = mlp.Predict(inputValues);
+            
+            cout << "Input: ";
+            cout << fixed << setprecision(4);
+            for (size_t i = 0; i < inputValues.size(); i++) {
+                if (i > 0) cout << ", ";
+                cout << inputValues[i];
+            }
+            cout << endl;
+            
+            cout << "Output: ";
+            cout << setprecision(6);
+            for (size_t i = 0; i < output.size(); i++) {
+                if (i > 0) cout << ", ";
+                cout << output[i];
+            }
+            cout << endl;
+            
+            if (output.size() > 1) {
+                int maxIdx = MaxIndex(output);
+                cout << "Max index: " << maxIdx << endl;
+            }
+            
+            return 0;
+        }
+        else if (command == cmdBatchPredict) {
             if (modelFile.empty()) { cerr << "Error: --model is required" << endl; return 1; }
             if (inputValues.empty()) { cerr << "Error: --input is required" << endl; return 1; }
             

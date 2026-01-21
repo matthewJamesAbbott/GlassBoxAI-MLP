@@ -1,0 +1,15 @@
+[package]
+name = "kani_verification"
+version = "1.0.0"
+edition = "2021"
+authors = ["Matthew Abbott"]
+license = "MIT"
+description = "Kani Verification Harnesses for Facaded MLP CUDA (CISA Hardening)"
+
+[lib]
+path = "lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[dependencies]

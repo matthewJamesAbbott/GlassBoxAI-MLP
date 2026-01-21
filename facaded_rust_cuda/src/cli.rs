@@ -8,82 +8,91 @@ pub enum TCommand {
     CmdNone, CmdCreate, CmdTrain, CmdPredict, CmdInfo, CmdHelp,
     CmdGetWeight, CmdSetWeight, CmdGetBias, CmdSetBias,
     CmdGetOutput, CmdGetError, CmdLayerInfo, CmdHistogram,
-    CmdGetOptimizer, CmdGetWeights, CmdGetAllOutputs,
+    CmdGetOptimizer, CmdGetWeights, CmdGetAllOutputs, CmdBatchPredict,
 }
 
 fn PrintUsage() {
-    println!("Facaded MLP CUDA (Rust) - Command-line Multi-Layer Perceptron (w/ Facade)");
+    println!("Facaded MLP");
+    println!();
+    println!("Usage: facaded_mlp <command> [options]");
     println!();
     println!("Commands:");
     println!("  create         Create a new MLP model");
     println!("  train          Train an existing model with data");
     println!("  predict        Make predictions with a trained model");
+    println!("  batch-predict  Make predictions with a trained model (batch)");
     println!("  info           Display model information");
-    println!("  get-weight     Get a single weight value");
-    println!("  set-weight     Set a single weight value");
-    println!("  get-weights    Get all weights for a neuron");
-    println!("  get-bias       Get bias value for a neuron");
-    println!("  set-bias       Set bias value for a neuron");
-    println!("  get-output     Get neuron output value");
-    println!("  get-outputs    Get all outputs for all layers");
-    println!("  get-error      Get neuron error value");
-    println!("  layer-info     Display layer information");
-    println!("  histogram      Display activation or gradient histogram");
-    println!("  get-optimizer  Get optimizer state values (M, V for Adam/RMSProp)");
+    println!("  get-weight     Get a single weight value (FACADE)");
+    println!("  set-weight     Set a single weight value (FACADE)");
+    println!("  get-weights    Get all weights for a neuron (FACADE)");
+    println!("  get-bias       Get bias value for a neuron (FACADE)");
+    println!("  set-bias       Set bias value for a neuron (FACADE)");
+    println!("  get-output     Get neuron output value (FACADE)");
+    println!("  get-error      Get neuron error value (FACADE)");
+    println!("  layer-info     Display layer information (FACADE)");
+    println!("  histogram      Display activation or error histogram (FACADE)");
+    println!("  get-optimizer  Get optimizer state values M, V (FACADE)");
     println!("  help           Show this help message");
     println!();
     println!("Create Options:");
-    println!("  --input=N              Input layer size (required)");
-    println!("  --hidden=N,N,...       Hidden layer sizes (required)");
-    println!("  --output=N             Output layer size (required)");
-    println!("  --save=FILE            Save model to file (required)");
-    println!("  --lr=VALUE             Learning rate (default: 0.1)");
-    println!("  --optimizer=TYPE       sgd|adam|rmsprop (default: sgd)");
-    println!("  --hidden-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)");
-    println!("  --output-act=TYPE      sigmoid|tanh|relu|softmax (default: sigmoid)");
-    println!("  --dropout=VALUE        Dropout rate 0-1 (default: 0)");
-    println!("  --l2=VALUE             L2 regularization (default: 0)");
-    println!("  --beta1=VALUE          Adam beta1 (default: 0.9)");
-    println!("  --beta2=VALUE          Adam beta2 (default: 0.999)");
+    println!("  -i, --input=N              Input layer size (required)");
+    println!("  -H, --hidden=N,N,...       Hidden layer sizes (required)");
+    println!("  -o, --output=N             Output layer size (required)");
+    println!("  -s, --save=FILE            Save model to file (required)");
+    println!("  --lr=VALUE                 Learning rate (default: 0.1)");
+    println!("  --optimizer=TYPE           sgd|adam|rmsprop (default: sgd)");
+    println!("  --hidden-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)");
+    println!("  --output-act=TYPE          sigmoid|tanh|relu|softmax (default: sigmoid)");
+    println!("  --dropout=VALUE            Dropout rate 0-1 (default: 0)");
+    println!("  --l2=VALUE                 L2 regularization (default: 0)");
+    println!("  --beta1=VALUE              Adam beta1 (default: 0.9)");
+    println!("  --beta2=VALUE              Adam beta2 (default: 0.999)");
     println!();
     println!("Train Options:");
-    println!("  --model=FILE           Model file to load (required)");
-    println!("  --data=FILE            Training data CSV file (required)");
-    println!("  --save=FILE            Save trained model to file (required)");
-    println!("  --epochs=N             Number of training epochs (default: 100)");
-    println!("  --batch=N              Batch size (default: 1)");
-    println!("  --lr=VALUE             Override learning rate");
-    println!("  --lr-decay             Enable learning rate decay");
-    println!("  --lr-decay-rate=VALUE  LR decay rate (default: 0.95)");
-    println!("  --lr-decay-epochs=N    Epochs between decay (default: 10)");
-    println!("  --early-stop           Enable early stopping");
-    println!("  --patience=N           Early stopping patience (default: 10)");
-    println!("  --normalize            Normalize input data");
-    println!("  --verbose              Show training progress");
+    println!("  -m, --model=FILE           Load model from file (required)");
+    println!("  -d, --data=FILE            Training data CSV file (required)");
+    println!("  -s, --save=FILE            Save trained model to file (required)");
+    println!("  --epochs=N                 Number of training epochs (default: 100)");
+    println!("  --batch=N                  Batch size (default: 1)");
+    println!("  --lr=VALUE                 Override learning rate");
+    println!("  --lr-decay                 Enable learning rate decay");
+    println!("  --lr-decay-rate=VALUE      LR decay rate (default: 0.95)");
+    println!("  --lr-decay-epochs=N        Epochs between decay (default: 10)");
+    println!("  --early-stop               Enable early stopping");
+    println!("  --patience=N               Early stopping patience (default: 10)");
+    println!("  --normalize                Normalize input data");
+    println!("  --verbose                  Show training progress");
     println!();
     println!("Predict Options:");
-    println!("  --model=FILE           Model file to load (required)");
-    println!("  --input=v1,v2,...      Input values (required)");
+    println!("  -m, --model=FILE           Model file to load (required)");
+    println!("  -i, --input=v1,v2,...      Input values (required)");
     println!();
-    println!("Facade Options:");
-    println!("  --layer=L              Layer index (required for facade commands)");
-    println!("  --neuron=N             Neuron index (required for most facade commands)");
-    println!("  --weight=W             Weight index within neuron (for weight commands)");
-    println!("  --value=V              Value to set (required for set-* commands)");
-    println!("  --bins=N               Number of histogram bins (default: 20)");
-    println!("  --type=TYPE            Histogram type: activation or gradient (default: activation)");
-    println!("  --run-input=v1,v2,...  Input values for get-output/layer-info/histogram");
+    println!("Info Options:");
+    println!("  -m, --model=FILE           Model file to load (required)");
+    println!();
+    println!("Facade Options (for get/set commands):");
+    println!("  -m, --model=FILE           Model file (required)");
+    println!("  --layer=L                  Layer index (required)");
+    println!("  --neuron=N                 Neuron index (required)");
+    println!("  --weight=W                 Weight index within neuron");
+    println!("  --value=V                  Value to set (required for set-* commands)");
+    println!("  -s, --save=FILE            Save modified model to file (required for set-* commands)");
+    println!("  --bins=N                   Number of histogram bins (default: 20)");
+    println!("  --type=TYPE                Histogram type: activation|error (default: activation)");
+    println!("  -i, --input=v1,v2,...      Input values for get-output command");
     println!();
     println!("Examples:");
-    println!("  facaded_mlp_cuda create --input=2 --hidden=8 --output=1 --save=xor.json");
-    println!("  facaded_mlp_cuda train --model=xor.json --data=xor.csv --epochs=1000 --save=xor_trained.json");
-    println!("  facaded_mlp_cuda predict --model=xor_trained.json --input=1,0");
-    println!("  facaded_mlp_cuda info --model=xor_trained.json");
-    println!("  facaded_mlp_cuda get-weight --model=xor.json --layer=1 --neuron=0 --weight=0");
-    println!("  facaded_mlp_cuda set-weight --model=xor.json --layer=1 --neuron=0 --weight=0 --value=0.5 --save=xor_mod.json");
-    println!("  facaded_mlp_cuda get-output --model=xor.json --layer=1 --run-input=1,0");
-    println!("  facaded_mlp_cuda layer-info --model=xor.json --layer=1 --run-input=1,0");
-    println!("  facaded_mlp_cuda histogram --model=xor.json --layer=1 --type=activation --run-input=1,0");
+    println!("  facaded_mlp create -i 2 -H 8 -o 1 -s xor.json");
+    println!("  facaded_mlp train -m xor.json -d data.csv -s xor_trained.json --epochs=1000");
+    println!("  facaded_mlp predict -m xor_trained.json -i 1,0");
+    println!("  facaded_mlp batch-predict -m xor_trained.json -i 1,0");
+    println!("  facaded_mlp info -m xor_trained.json");
+    println!("  facaded_mlp get-weight -m xor.json --layer=1 --neuron=0 --weight=0");
+    println!("  facaded_mlp set-weight -m xor.json --layer=1 --neuron=0 --weight=0 --value=0.5 -s xor_mod.json");
+    println!("  facaded_mlp layer-info -m xor.json --layer=0");
+    println!("  facaded_mlp histogram -m xor.json --layer=1 --bins=30 --type=activation");
+    println!("  facaded_mlp get-output -m xor.json --layer=0 --neuron=3 -i 1,0");
+    println!("  facaded_mlp get-optimizer -m xor.json --layer=1 --neuron=0");
 }
 
 pub fn run() {
@@ -99,6 +108,7 @@ pub fn run() {
         "create" => TCommand::CmdCreate,
         "train" => TCommand::CmdTrain,
         "predict" => TCommand::CmdPredict,
+        "batch-predict" => TCommand::CmdBatchPredict,
         "info" => TCommand::CmdInfo,
         "help" | "--help" | "-h" => TCommand::CmdHelp,
         "get-weight" => TCommand::CmdGetWeight,
@@ -170,7 +180,7 @@ pub fn run() {
             let value = &arg[eq + 1..];
             match key {
                 "--input" => {
-                    if command == TCommand::CmdPredict { input_values = ParseDoubleArray(value); }
+                    if command == TCommand::CmdPredict || command == TCommand::CmdBatchPredict { input_values = ParseDoubleArray(value); }
                     else { input_size = value.parse().unwrap_or(0); }
                 }
                 "--hidden" => hidden_sizes = ParseIntArray(value),
@@ -274,6 +284,22 @@ pub fn run() {
             println!("Model saved to: {}", save_file);
         }
         TCommand::CmdPredict => {
+            if model_file.is_empty() { eprintln!("Error: --model is required"); process::exit(1); }
+            if input_values.is_empty() { eprintln!("Error: --input is required"); process::exit(1); }
+
+            let mut mlp = match TMultiLayerPerceptronCUDA::Load(&model_file) {
+                Ok(m) => m, Err(e) => { eprintln!("Error: {}", e); process::exit(1); }
+            };
+            if input_values.len() as i32 != mlp.GetInputSize() {
+                eprintln!("Error: Expected {} input values, got {}", mlp.GetInputSize(), input_values.len());
+                process::exit(1);
+            }
+            let output = mlp.Predict(&input_values).unwrap();
+            print!("Input: "); for (i, &v) in input_values.iter().enumerate() { print!("{}{:.4}", if i > 0 { ", " } else { "" }, v); } println!();
+            print!("Output: "); for (i, &v) in output.iter().enumerate() { print!("{}{:.6}", if i > 0 { ", " } else { "" }, v); } println!();
+            if output.len() > 1 { println!("Max index: {}", MaxIndex(&output)); }
+        }
+        TCommand::CmdBatchPredict => {
             if model_file.is_empty() { eprintln!("Error: --model is required"); process::exit(1); }
             if input_values.is_empty() { eprintln!("Error: --input is required"); process::exit(1); }
 

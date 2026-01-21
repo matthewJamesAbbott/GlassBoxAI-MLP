@@ -1145,6 +1145,7 @@ void PrintUsage() {
     cout << "  create         Create a new MLP model" << endl;
     cout << "  train          Train an existing model with data" << endl;
     cout << "  predict        Make predictions with a trained model" << endl;
+    cout << "  batch-predict  Make predictions with a trained model (batch)" << endl;
     cout << "  info           Display model information" << endl;
     cout << "  get-weight     Get a single weight value (FACADE)" << endl;
     cout << "  set-weight     Set a single weight value (FACADE)" << endl;
@@ -1209,6 +1210,7 @@ void PrintUsage() {
     cout << "  facaded_mlp create -i 2 -H 8 -o 1 -s xor.json" << endl;
     cout << "  facaded_mlp train -m xor.json -d data.csv -s xor_trained.json --epochs=1000" << endl;
     cout << "  facaded_mlp predict -m xor_trained.json -i 1,0" << endl;
+    cout << "  facaded_mlp batch-predict -m xor_trained.json -i 1,0" << endl;
     cout << "  facaded_mlp info -m xor_trained.json" << endl;
     cout << "  facaded_mlp get-weight -m xor.json --layer=1 --neuron=0 --weight=0" << endl;
     cout << "  facaded_mlp set-weight -m xor.json --layer=1 --neuron=0 --weight=0 --value=0.5 -s xor_mod.json" << endl;
