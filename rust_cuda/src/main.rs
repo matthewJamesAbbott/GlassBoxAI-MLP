@@ -283,6 +283,64 @@ __global__ void UpdateWeightsRMSPropKernel(
     }
 }
 
+__global__ void BatchNormForwardTrainKernel(
+    double* output, double* input, double* gamma, double* beta,
+    double* runningMean, double* runningVar,
+    double* batchMean, double* batchVar,
+    int n, double momentum, double epsilon
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double mean = batchMean[i];
+        double var = batchVar[i];
+        double xNorm = (input[i] - mean) / sqrt(var + epsilon);
+        output[i] = gamma[i] * xNorm + beta[i];
+        runningMean[i] = (1.0 - momentum) * runningMean[i] + momentum * mean;
+        runningVar[i] = (1.0 - momentum) * runningVar[i] + momentum * var;
+    }
+}
+
+__global__ void BatchNormForwardInferKernel(
+    double* output, double* input, double* gamma, double* beta,
+    double* runningMean, double* runningVar,
+    int n, double epsilon
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double xNorm = (input[i] - runningMean[i]) / sqrt(runningVar[i] + epsilon);
+        output[i] = gamma[i] * xNorm + beta[i];
+    }
+}
+
+__global__ void BatchNormBackwardKernel(
+    double* dInput, double* dGamma, double* dBeta,
+    double* dOutput, double* input, double* gamma,
+    double* batchMean, double* batchVar,
+    int n, double epsilon
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double mean = batchMean[i];
+        double var = batchVar[i];
+        double stdInv = 1.0 / sqrt(var + epsilon);
+        double xNorm = (input[i] - mean) * stdInv;
+        
+        dGamma[i] = dOutput[i] * xNorm;
+        dBeta[i] = dOutput[i];
+        dInput[i] = dOutput[i] * gamma[i] * stdInv;
+    }
+}
+
+__global__ void ComputeBatchMeanVarKernel(
+    double* batchMean, double* batchVar, double* input, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        batchMean[i] = input[i];
+        batchVar[i] = 0.0;
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -312,6 +370,8 @@ pub enum TCommand {
     CmdPredict,
     CmdInfo,
     CmdHelp,
+    CmdExportONNX,
+    CmdFeatureImportance,
 }
 
 pub type Darray = Vec<f64>;
@@ -340,6 +400,12 @@ pub struct LayerDataCUDA {
     pub NumNeurons: i32,
     pub NumInputs: i32,
     pub ActivationType: TActivationType,
+    pub d_Gamma: CudaSlice<f64>,
+    pub d_Beta: CudaSlice<f64>,
+    pub d_RunningMean: CudaSlice<f64>,
+    pub d_RunningVar: CudaSlice<f64>,
+    pub d_BatchMean: CudaSlice<f64>,
+    pub d_BatchVar: CudaSlice<f64>,
 }
 
 fn ActivationToStr(act: TActivationType) -> &'static str {
@@ -435,6 +501,14 @@ struct OutputLayerJSON {
 }
 
 #[derive(Serialize, Deserialize)]
+struct BatchNormParamsJSON {
+    gamma: Vec<f64>,
+    beta: Vec<f64>,
+    running_mean: Vec<f64>,
+    running_var: Vec<f64>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct ModelJSON {
     magic: String,
     input_size: i32,
@@ -448,9 +522,13 @@ struct ModelJSON {
     l2_lambda: f64,
     beta1: f64,
     beta2: f64,
+    #[serde(default)]
+    batch_norm: bool,
     input_layer: InputLayerJSON,
     hidden_layers: Vec<HiddenLayerJSON>,
     output_layer: OutputLayerJSON,
+    #[serde(default)]
+    batch_norm_params: Vec<BatchNormParamsJSON>,
 }
 
 pub struct TMultiLayerPerceptronCUDA {
@@ -482,6 +560,9 @@ pub struct TMultiLayerPerceptronCUDA {
     pub LRDecayEpochs: i32,
     pub EnableEarlyStopping: bool,
     pub EarlyStoppingPatience: i32,
+    pub BatchNormEnabled: bool,
+    pub BatchNormMomentum: f64,
+    pub BatchNormEpsilon: f64,
 }
 
 impl TMultiLayerPerceptronCUDA {
@@ -506,6 +587,10 @@ impl TMultiLayerPerceptronCUDA {
             "UpdateWeightsSGDKernel",
             "UpdateWeightsAdamKernel",
             "UpdateWeightsRMSPropKernel",
+            "BatchNormForwardTrainKernel",
+            "BatchNormForwardInferKernel",
+            "BatchNormBackwardKernel",
+            "ComputeBatchMeanVarKernel",
         ])?;
 
         let num_layers = (HiddenSizes.len() as i32) + 2;
@@ -579,6 +664,9 @@ impl TMultiLayerPerceptronCUDA {
             LRDecayEpochs: 10,
             EnableEarlyStopping: false,
             EarlyStoppingPatience: 10,
+            BatchNormEnabled: false,
+            BatchNormMomentum: 0.1,
+            BatchNormEpsilon: 1e-5,
         })
     }
 
@@ -614,6 +702,15 @@ impl TMultiLayerPerceptronCUDA {
         let dropout_mask: Vec<u8> = vec![1u8; neuron_count];
         let d_dropout_mask = dev.htod_copy(dropout_mask)?;
 
+        let gamma_init: Vec<f64> = vec![1.0; neuron_count];
+        let d_gamma = dev.htod_copy(gamma_init)?;
+        let d_beta = dev.alloc_zeros::<f64>(neuron_count)?;
+        let d_running_mean = dev.alloc_zeros::<f64>(neuron_count)?;
+        let running_var_init: Vec<f64> = vec![1.0; neuron_count];
+        let d_running_var = dev.htod_copy(running_var_init)?;
+        let d_batch_mean = dev.alloc_zeros::<f64>(neuron_count)?;
+        let d_batch_var = dev.alloc_zeros::<f64>(neuron_count)?;
+
         Ok(LayerDataCUDA {
             Weights: d_weights,
             Biases: d_biases,
@@ -627,6 +724,12 @@ impl TMultiLayerPerceptronCUDA {
             NumNeurons: num_neurons,
             NumInputs: num_inputs,
             ActivationType: act_type,
+            d_Gamma: d_gamma,
+            d_Beta: d_beta,
+            d_RunningMean: d_running_mean,
+            d_RunningVar: d_running_var,
+            d_BatchMean: d_batch_mean,
+            d_BatchVar: d_batch_var,
         })
     }
 
@@ -640,29 +743,42 @@ impl TMultiLayerPerceptronCUDA {
         let dropout_kernel = self.Dev.get_func("mlp_kernels", "ApplyDropoutKernel").unwrap();
 
         for k in 1..(num_layers - 1) {
-            let layer = &self.Layers[k];
-            let prev_layer = &self.Layers[k - 1];
-            let blocks = Self::GetBlocks(layer.NumNeurons);
-            let cfg = LaunchConfig {
-                block_dim: (BLOCK_SIZE, 1, 1),
-                grid_dim: (blocks, 1, 1),
-                shared_mem_bytes: 0,
-            };
+            {
+                let layer = &self.Layers[k];
+                let prev_layer = &self.Layers[k - 1];
+                let blocks = Self::GetBlocks(layer.NumNeurons);
+                let cfg = LaunchConfig {
+                    block_dim: (BLOCK_SIZE, 1, 1),
+                    grid_dim: (blocks, 1, 1),
+                    shared_mem_bytes: 0,
+                };
 
-            unsafe {
-                ff_kernel.clone().launch(cfg, (
-                    &layer.Outputs,
-                    &layer.Weights,
-                    &layer.Biases,
-                    &prev_layer.Outputs,
-                    layer.NumNeurons,
-                    layer.NumInputs,
-                    prev_layer.NumNeurons,
-                    layer.ActivationType as i32,
-                ))?;
+                unsafe {
+                    ff_kernel.clone().launch(cfg, (
+                        &layer.Outputs,
+                        &layer.Weights,
+                        &layer.Biases,
+                        &prev_layer.Outputs,
+                        layer.NumNeurons,
+                        layer.NumInputs,
+                        prev_layer.NumNeurons,
+                        layer.ActivationType as i32,
+                    ))?;
+                }
+            }
+
+            if self.BatchNormEnabled {
+                self.ApplyBatchNorm(k)?;
             }
 
             if self.FIsTraining && self.DropoutRate > 0.0 {
+                let layer = &self.Layers[k];
+                let blocks = Self::GetBlocks(layer.NumNeurons);
+                let cfg = LaunchConfig {
+                    block_dim: (BLOCK_SIZE, 1, 1),
+                    grid_dim: (blocks, 1, 1),
+                    shared_mem_bytes: 0,
+                };
                 let scale = 1.0 / (1.0 - self.DropoutRate);
                 let seed = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -971,6 +1087,318 @@ impl TMultiLayerPerceptronCUDA {
         self.Layers[layer_idx].NumNeurons
     }
 
+    fn ApplyBatchNorm(&mut self, layer_idx: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let layer = &self.Layers[layer_idx];
+        let num_neurons = layer.NumNeurons;
+        let blocks = Self::GetBlocks(num_neurons);
+        let cfg = LaunchConfig {
+            block_dim: (BLOCK_SIZE, 1, 1),
+            grid_dim: (blocks, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        if self.FIsTraining {
+            let compute_kernel = self.Dev.get_func("mlp_kernels", "ComputeBatchMeanVarKernel").unwrap();
+            unsafe {
+                compute_kernel.clone().launch(cfg, (
+                    &layer.d_BatchMean,
+                    &layer.d_BatchVar,
+                    &layer.Outputs,
+                    num_neurons,
+                ))?;
+            }
+            self.Dev.synchronize()?;
+
+            let bn_kernel = self.Dev.get_func("mlp_kernels", "BatchNormForwardTrainKernel").unwrap();
+            unsafe {
+                bn_kernel.clone().launch(cfg, (
+                    &layer.Outputs,
+                    &layer.Outputs,
+                    &layer.d_Gamma,
+                    &layer.d_Beta,
+                    &layer.d_RunningMean,
+                    &layer.d_RunningVar,
+                    &layer.d_BatchMean,
+                    &layer.d_BatchVar,
+                    num_neurons,
+                    self.BatchNormMomentum,
+                    self.BatchNormEpsilon,
+                ))?;
+            }
+        } else {
+            let bn_kernel = self.Dev.get_func("mlp_kernels", "BatchNormForwardInferKernel").unwrap();
+            unsafe {
+                bn_kernel.clone().launch(cfg, (
+                    &layer.Outputs,
+                    &layer.Outputs,
+                    &layer.d_Gamma,
+                    &layer.d_Beta,
+                    &layer.d_RunningMean,
+                    &layer.d_RunningVar,
+                    num_neurons,
+                    self.BatchNormEpsilon,
+                ))?;
+            }
+        }
+        self.Dev.synchronize()?;
+        Ok(())
+    }
+
+    pub fn export_to_onnx(&self, filename: &str) -> io::Result<()> {
+        let mut file = File::create(filename)?;
+
+        fn write_varint(buf: &mut Vec<u8>, mut val: u64) {
+            while val >= 0x80 {
+                buf.push((val as u8) | 0x80);
+                val >>= 7;
+            }
+            buf.push(val as u8);
+        }
+
+        fn write_field(buf: &mut Vec<u8>, field_num: u32, wire_type: u8, data: &[u8]) {
+            let tag = (field_num << 3) | (wire_type as u32);
+            write_varint(buf, tag as u64);
+            if wire_type == 2 {
+                write_varint(buf, data.len() as u64);
+            }
+            buf.extend_from_slice(data);
+        }
+
+        fn write_string(buf: &mut Vec<u8>, field_num: u32, s: &str) {
+            write_field(buf, field_num, 2, s.as_bytes());
+        }
+
+        fn write_int64(buf: &mut Vec<u8>, field_num: u32, val: i64) {
+            let mut tmp = Vec::new();
+            write_varint(&mut tmp, val as u64);
+            let tag = (field_num << 3) | 0;
+            write_varint(buf, tag as u64);
+            buf.extend_from_slice(&tmp);
+        }
+
+        fn write_float_array(buf: &mut Vec<u8>, field_num: u32, vals: &[f32]) {
+            let mut data = Vec::new();
+            for &v in vals {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            write_field(buf, field_num, 2, &data);
+        }
+
+        fn build_tensor_proto(name: &str, dims: &[i64], data: &[f32]) -> Vec<u8> {
+            let mut tensor = Vec::new();
+            for &d in dims {
+                write_int64(&mut tensor, 1, d);
+            }
+            write_int64(&mut tensor, 2, 1);
+            write_float_array(&mut tensor, 4, data);
+            write_string(&mut tensor, 8, name);
+            tensor
+        }
+
+        fn build_node_proto(op_type: &str, inputs: &[&str], outputs: &[&str], name: &str) -> Vec<u8> {
+            let mut node = Vec::new();
+            for inp in inputs {
+                write_string(&mut node, 1, inp);
+            }
+            for out in outputs {
+                write_string(&mut node, 2, out);
+            }
+            write_string(&mut node, 3, name);
+            write_string(&mut node, 4, op_type);
+            node
+        }
+
+        fn build_value_info(name: &str, dims: &[i64]) -> Vec<u8> {
+            let mut shape = Vec::new();
+            for &d in dims {
+                let mut dim = Vec::new();
+                write_int64(&mut dim, 1, d);
+                write_field(&mut shape, 1, 2, &dim);
+            }
+
+            let mut tensor_type = Vec::new();
+            write_int64(&mut tensor_type, 1, 1);
+            write_field(&mut tensor_type, 2, 2, &shape);
+
+            let mut type_proto = Vec::new();
+            write_field(&mut type_proto, 1, 2, &tensor_type);
+
+            let mut vi = Vec::new();
+            write_string(&mut vi, 1, name);
+            write_field(&mut vi, 2, 2, &type_proto);
+            vi
+        }
+
+        let mut initializers: Vec<Vec<u8>> = Vec::new();
+        let mut nodes: Vec<Vec<u8>> = Vec::new();
+        let mut prev_output = "input".to_string();
+
+        for h in 0..self.FHiddenSizes.len() {
+            let layer = &self.Layers[h + 1];
+            let num_neurons = self.FHiddenSizes[h];
+            let num_inputs = if h == 0 { self.FInputSize } else { self.FHiddenSizes[h - 1] };
+
+            let h_weights = self.Dev.dtoh_sync_copy(&layer.Weights).unwrap();
+            let h_biases = self.Dev.dtoh_sync_copy(&layer.Biases).unwrap();
+
+            let mut weights_f32: Vec<f32> = Vec::new();
+            for j in 0..num_neurons as usize {
+                for w in 0..num_inputs as usize {
+                    weights_f32.push(h_weights[j * layer.NumInputs as usize + w] as f32);
+                }
+            }
+            let biases_f32: Vec<f32> = h_biases[..num_neurons as usize].iter().map(|&x| x as f32).collect();
+
+            let w_name = format!("hidden{}_weights", h);
+            let b_name = format!("hidden{}_biases", h);
+            let gemm_out = format!("hidden{}_gemm", h);
+            let act_out = format!("hidden{}_out", h);
+
+            initializers.push(build_tensor_proto(&w_name, &[num_neurons as i64, num_inputs as i64], &weights_f32));
+            initializers.push(build_tensor_proto(&b_name, &[num_neurons as i64], &biases_f32));
+
+            nodes.push(build_node_proto("Gemm", &[&prev_output, &w_name, &b_name], &[&gemm_out], &format!("gemm_{}", h)));
+
+            if self.BatchNormEnabled {
+                let h_gamma = self.Dev.dtoh_sync_copy(&layer.d_Gamma).unwrap();
+                let h_beta = self.Dev.dtoh_sync_copy(&layer.d_Beta).unwrap();
+                let h_mean = self.Dev.dtoh_sync_copy(&layer.d_RunningMean).unwrap();
+                let h_var = self.Dev.dtoh_sync_copy(&layer.d_RunningVar).unwrap();
+
+                let gamma_f32: Vec<f32> = h_gamma[..num_neurons as usize].iter().map(|&x| x as f32).collect();
+                let beta_f32: Vec<f32> = h_beta[..num_neurons as usize].iter().map(|&x| x as f32).collect();
+                let mean_f32: Vec<f32> = h_mean[..num_neurons as usize].iter().map(|&x| x as f32).collect();
+                let var_f32: Vec<f32> = h_var[..num_neurons as usize].iter().map(|&x| x as f32).collect();
+
+                let bn_scale = format!("bn{}_scale", h);
+                let bn_bias = format!("bn{}_bias", h);
+                let bn_mean = format!("bn{}_mean", h);
+                let bn_var = format!("bn{}_var", h);
+                let bn_out = format!("bn{}_out", h);
+
+                initializers.push(build_tensor_proto(&bn_scale, &[num_neurons as i64], &gamma_f32));
+                initializers.push(build_tensor_proto(&bn_bias, &[num_neurons as i64], &beta_f32));
+                initializers.push(build_tensor_proto(&bn_mean, &[num_neurons as i64], &mean_f32));
+                initializers.push(build_tensor_proto(&bn_var, &[num_neurons as i64], &var_f32));
+
+                nodes.push(build_node_proto("BatchNormalization", 
+                    &[&gemm_out, &bn_scale, &bn_bias, &bn_mean, &bn_var], 
+                    &[&bn_out], 
+                    &format!("bn_{}", h)));
+
+                let act_type = match self.HiddenActivation {
+                    TActivationType::atReLU => "Relu",
+                    TActivationType::atTanh => "Tanh",
+                    TActivationType::atSigmoid => "Sigmoid",
+                    _ => "Relu",
+                };
+                nodes.push(build_node_proto(act_type, &[&bn_out], &[&act_out], &format!("act_{}", h)));
+            } else {
+                let act_type = match self.HiddenActivation {
+                    TActivationType::atReLU => "Relu",
+                    TActivationType::atTanh => "Tanh",
+                    TActivationType::atSigmoid => "Sigmoid",
+                    _ => "Relu",
+                };
+                nodes.push(build_node_proto(act_type, &[&gemm_out], &[&act_out], &format!("act_{}", h)));
+            }
+
+            prev_output = act_out;
+        }
+
+        let num_layers = self.NumLayers as usize;
+        let out_layer = &self.Layers[num_layers - 1];
+        let out_num_inputs = if self.FHiddenSizes.is_empty() { self.FInputSize } else { *self.FHiddenSizes.last().unwrap() };
+
+        let h_weights = self.Dev.dtoh_sync_copy(&out_layer.Weights).unwrap();
+        let h_biases = self.Dev.dtoh_sync_copy(&out_layer.Biases).unwrap();
+
+        let mut weights_f32: Vec<f32> = Vec::new();
+        for i in 0..self.FOutputSize as usize {
+            for w in 0..out_num_inputs as usize {
+                weights_f32.push(h_weights[i * out_layer.NumInputs as usize + w] as f32);
+            }
+        }
+        let biases_f32: Vec<f32> = h_biases[..self.FOutputSize as usize].iter().map(|&x| x as f32).collect();
+
+        initializers.push(build_tensor_proto("output_weights", &[self.FOutputSize as i64, out_num_inputs as i64], &weights_f32));
+        initializers.push(build_tensor_proto("output_biases", &[self.FOutputSize as i64], &biases_f32));
+
+        nodes.push(build_node_proto("Gemm", &[&prev_output, "output_weights", "output_biases"], &["output_gemm"], "gemm_output"));
+
+        let final_output = if self.OutputActivation == TActivationType::atSoftmax {
+            nodes.push(build_node_proto("Softmax", &["output_gemm"], &["output"], "softmax_output"));
+            "output"
+        } else {
+            let act_type = match self.OutputActivation {
+                TActivationType::atReLU => "Relu",
+                TActivationType::atTanh => "Tanh",
+                TActivationType::atSigmoid => "Sigmoid",
+                TActivationType::atLinear => { "output_gemm" }
+                _ => "Sigmoid",
+            };
+            if act_type != "output_gemm" {
+                nodes.push(build_node_proto(act_type, &["output_gemm"], &["output"], "act_output"));
+                "output"
+            } else {
+                "output_gemm"
+            }
+        };
+
+        let input_info = build_value_info("input", &[1, self.FInputSize as i64]);
+        let output_info = build_value_info(final_output, &[1, self.FOutputSize as i64]);
+
+        let mut graph = Vec::new();
+        for node in &nodes {
+            write_field(&mut graph, 1, 2, node);
+        }
+        write_string(&mut graph, 2, "mlp_graph");
+        for init in &initializers {
+            write_field(&mut graph, 5, 2, init);
+        }
+        write_field(&mut graph, 11, 2, &input_info);
+        write_field(&mut graph, 12, 2, &output_info);
+
+        let mut model = Vec::new();
+        write_int64(&mut model, 1, 7);
+        write_string(&mut model, 2, "rust_cuda_mlp");
+        write_string(&mut model, 3, "1.0");
+        write_string(&mut model, 4, "ai.onnx");
+        write_int64(&mut model, 5, 13);
+        write_field(&mut model, 7, 2, &graph);
+
+        file.write_all(&model)?;
+        Ok(())
+    }
+
+    pub fn feature_importance(&self) -> Vec<(usize, f64)> {
+        if self.Layers.len() < 2 {
+            return Vec::new();
+        }
+
+        let first_hidden = &self.Layers[1];
+        let h_weights = self.Dev.dtoh_sync_copy(&first_hidden.Weights).unwrap();
+        
+        let num_neurons = first_hidden.NumNeurons as usize;
+        let num_inputs = self.FInputSize as usize;
+        
+        let mut importance: Vec<(usize, f64)> = (0..num_inputs)
+            .map(|input_idx| {
+                let mut sum = 0.0;
+                for neuron_idx in 0..num_neurons {
+                    let weight_idx = neuron_idx * first_hidden.NumInputs as usize + input_idx;
+                    if weight_idx < h_weights.len() {
+                        sum += h_weights[weight_idx].abs();
+                    }
+                }
+                (input_idx, sum)
+            })
+            .collect();
+        
+        importance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        importance
+    }
+
     pub fn SaveModelToJSON(&self, filename: &str) -> io::Result<()> {
         let mut hidden_layers_json = Vec::new();
 
@@ -1034,6 +1462,24 @@ impl TMultiLayerPerceptronCUDA {
             .map(|i| h_biases[i])
             .collect();
 
+        let mut batch_norm_params = Vec::new();
+        if self.BatchNormEnabled {
+            for h in 0..self.FHiddenSizes.len() {
+                let layer = &self.Layers[h + 1];
+                let num_neurons = self.FHiddenSizes[h] as usize;
+                let gamma = self.Dev.dtoh_sync_copy(&layer.d_Gamma).unwrap();
+                let beta = self.Dev.dtoh_sync_copy(&layer.d_Beta).unwrap();
+                let running_mean = self.Dev.dtoh_sync_copy(&layer.d_RunningMean).unwrap();
+                let running_var = self.Dev.dtoh_sync_copy(&layer.d_RunningVar).unwrap();
+                batch_norm_params.push(BatchNormParamsJSON {
+                    gamma: gamma[..num_neurons].to_vec(),
+                    beta: beta[..num_neurons].to_vec(),
+                    running_mean: running_mean[..num_neurons].to_vec(),
+                    running_var: running_var[..num_neurons].to_vec(),
+                });
+            }
+        }
+
         let model = ModelJSON {
             magic: MODEL_MAGIC.to_string(),
             input_size: self.FInputSize,
@@ -1047,6 +1493,7 @@ impl TMultiLayerPerceptronCUDA {
             l2_lambda: self.L2Lambda,
             beta1: self.Beta1,
             beta2: self.Beta2,
+            batch_norm: self.BatchNormEnabled,
             input_layer: InputLayerJSON {
                 neuron_count: self.FInputSize,
             },
@@ -1056,6 +1503,7 @@ impl TMultiLayerPerceptronCUDA {
                 neurons: out_neurons,
                 biases: out_biases,
             },
+            batch_norm_params,
         };
 
         let json = serde_json::to_string_pretty(&model).map_err(|e| {
@@ -1104,6 +1552,7 @@ impl TMultiLayerPerceptronCUDA {
         self.L2Lambda = model.l2_lambda;
         self.Beta1 = model.beta1;
         self.Beta2 = model.beta2;
+        self.BatchNormEnabled = model.batch_norm;
 
         self.NumLayers = (new_hidden_sizes.len() as i32) + 2;
         self.Layers.clear();
@@ -1154,6 +1603,25 @@ impl TMultiLayerPerceptronCUDA {
 
                 self.Dev.htod_sync_copy_into(&h_weights, &mut layer.Weights)?;
                 self.Dev.htod_sync_copy_into(&h_biases, &mut layer.Biases)?;
+            }
+
+            if self.BatchNormEnabled && h < model.batch_norm_params.len() {
+                let bn = &model.batch_norm_params[h];
+                let num_neurons = hidden_size as usize;
+                let mut gamma = vec![1.0f64; layer.NumNeurons as usize];
+                let mut beta = vec![0.0f64; layer.NumNeurons as usize];
+                let mut running_mean = vec![0.0f64; layer.NumNeurons as usize];
+                let mut running_var = vec![1.0f64; layer.NumNeurons as usize];
+                for i in 0..num_neurons.min(bn.gamma.len()) {
+                    gamma[i] = bn.gamma[i];
+                    beta[i] = bn.beta[i];
+                    running_mean[i] = bn.running_mean[i];
+                    running_var[i] = bn.running_var[i];
+                }
+                self.Dev.htod_sync_copy_into(&gamma, &mut layer.d_Gamma)?;
+                self.Dev.htod_sync_copy_into(&beta, &mut layer.d_Beta)?;
+                self.Dev.htod_sync_copy_into(&running_mean, &mut layer.d_RunningMean)?;
+                self.Dev.htod_sync_copy_into(&running_var, &mut layer.d_RunningVar)?;
             }
 
             self.Layers.push(layer);
@@ -1306,11 +1774,13 @@ fn PrintUsage() {
     println!("Usage: mlp_cuda <command> [options]");
     println!();
     println!("Commands:");
-    println!("  create   Create a new MLP model");
-    println!("  train    Train an existing model");
-    println!("  predict  Make predictions with a model");
-    println!("  info     Display model information");
-    println!("  help     Show this help message");
+    println!("  create       Create a new MLP model");
+    println!("  train        Train an existing model");
+    println!("  predict      Make predictions with a model");
+    println!("  info         Display model information");
+    println!("  export-onnx  Export model to ONNX format");
+    println!("  feature-importance  Calculate feature importance");
+    println!("  help         Show this help message");
     println!();
     println!("Create Options:");
     println!("  -i, --input=N              Input layer size (required)");
@@ -1325,6 +1795,7 @@ fn PrintUsage() {
     println!("  --l2=VALUE                 L2 regularization lambda (default: 0)");
     println!("  --beta1=VALUE              Adam beta1 parameter (default: 0.9)");
     println!("  --beta2=VALUE              Adam beta2 parameter (default: 0.999)");
+    println!("  --batch-norm               Enable batch normalization");
     println!();
     println!("Train Options:");
     println!("  -m, --model=FILE           Load model file (required, .json)");
@@ -1346,6 +1817,13 @@ fn PrintUsage() {
     println!("  -i, --input=v1,v2,...      Input values, comma-separated (required)");
     println!();
     println!("Info Options:");
+    println!("  -m, --model=FILE           Model file (required, .json)");
+    println!();
+    println!("Export ONNX Options:");
+    println!("  -m, --model=FILE           Model file (required, .json)");
+    println!("  -s, --save=FILE            Output ONNX file (required, .onnx)");
+    println!();
+    println!("Feature Importance Options:");
     println!("  -m, --model=FILE           Model file (required, .json)");
     println!();
     println!("Examples:");
@@ -1376,6 +1854,8 @@ fn main() {
         "train" => TCommand::CmdTrain,
         "predict" => TCommand::CmdPredict,
         "info" => TCommand::CmdInfo,
+        "export-onnx" => TCommand::CmdExportONNX,
+        "feature-importance" => TCommand::CmdFeatureImportance,
         "help" | "--help" | "-h" => TCommand::CmdHelp,
         _ => {
             eprintln!("Error: Unknown command: {}", cmd_str);
@@ -1413,6 +1893,7 @@ fn main() {
     let mut save_file = String::new();
     let mut data_file = String::new();
     let mut input_values: TDoubleArray = Vec::new();
+    let mut batch_norm: bool = false;
 
     let mut i = 2;
     while i < args.len() {
@@ -1439,6 +1920,10 @@ fn main() {
                 continue;
             } else if arg == "--verbose" {
                 verbose = true;
+                i += 1;
+                continue;
+            } else if arg == "--batch-norm" {
+                batch_norm = true;
                 i += 1;
                 continue;
             } else if arg == "-h" {
@@ -1585,6 +2070,7 @@ fn main() {
             mlp.L2Lambda = l2_lambda;
             mlp.Beta1 = beta1;
             mlp.Beta2 = beta2;
+            mlp.BatchNormEnabled = batch_norm;
 
             println!("Created MLP model:");
             println!("  Input size: {}", input_size);
@@ -1603,6 +2089,7 @@ fn main() {
             println!("  Learning rate: {:.6}", learning_rate);
             println!("  Dropout rate: {:.4}", dropout_rate);
             println!("  L2 lambda: {:.6}", l2_lambda);
+            println!("  Batch normalization: {}", if batch_norm { "enabled" } else { "disabled" });
 
             if let Err(e) = mlp.SaveModelToJSON(&save_file) {
                 eprintln!("Error saving model: {}", e);
@@ -1734,6 +2221,7 @@ fn main() {
             println!("  Beta1: {:.4}", mlp.Beta1);
             println!("  Beta2: {:.4}", mlp.Beta2);
             println!("  Timestep: {}", mlp.Timestep);
+            println!("  Batch normalization: {}", if mlp.BatchNormEnabled { "enabled" } else { "disabled" });
             println!();
             println!("Total layers: {}", mlp.GetHiddenLayerCount() + 2);
             println!("  Layer 0: {} neurons (input)", mlp.GetInputSize());
@@ -1745,6 +2233,51 @@ fn main() {
                 mlp.GetHiddenLayerCount() + 1,
                 mlp.GetOutputSize()
             );
+        }
+        TCommand::CmdExportONNX => {
+            if model_file.is_empty() {
+                eprintln!("Error: --model (-m) is required");
+                process::exit(1);
+            }
+            if save_file.is_empty() {
+                eprintln!("Error: --save (-s) is required");
+                process::exit(1);
+            }
+
+            let mlp = match TMultiLayerPerceptronCUDA::Load(&model_file) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error loading model: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            if let Err(e) = mlp.export_to_onnx(&save_file) {
+                eprintln!("Error exporting to ONNX: {}", e);
+                process::exit(1);
+            }
+            println!("Model exported to ONNX: {}", save_file);
+        }
+        TCommand::CmdFeatureImportance => {
+            if model_file.is_empty() {
+                eprintln!("Error: --model (-m) is required");
+                process::exit(1);
+            }
+
+            let mlp = match TMultiLayerPerceptronCUDA::Load(&model_file) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Error loading model: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            let importance = mlp.feature_importance();
+            println!("Feature Importance (ranked by weight magnitude sum):");
+            println!("=====================================================");
+            for (rank, (idx, score)) in importance.iter().enumerate() {
+                println!("  Rank {}: Feature {} - Score: {:.6}", rank + 1, idx, score);
+            }
         }
         _ => {}
     }

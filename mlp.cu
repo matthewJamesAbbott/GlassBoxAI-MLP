@@ -56,7 +56,7 @@ const string MODEL_MAGIC = "MLPBKND01";
 
 enum TActivationType { atSigmoid = 0, atTanh = 1, atReLU = 2, atSoftmax = 3, atLinear = 4 };
 enum TOptimizerType { otSGD = 0, otAdam = 1, otRMSProp = 2 };
-enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp };
+enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp, cmdExportONNX, cmdFeatureImportance };
 
 typedef vector<double> Darray;
 typedef vector<double> TDoubleArray;
@@ -129,6 +129,13 @@ struct LayerData {
     double* MBias;
     double* VBias;
     bool* DropoutMask;
+    double* d_Gamma;
+    double* d_Beta;
+    double* d_RunningMean;
+    double* d_RunningVar;
+    double* d_BatchNormOutput;
+    double* d_BatchNormMean;
+    double* d_BatchNormVar;
     int NumNeurons;
     int NumInputs;
     TActivationType ActivationType;
@@ -291,6 +298,121 @@ __global__ void UpdateWeightsRMSPropKernel(LayerData layer, double* prevOutputs,
     }
 }
 
+const double BATCH_NORM_EPSILON = 1e-5;
+const double BATCH_NORM_MOMENTUM = 0.1;
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 600
+__device__ double atomicAddDouble(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#else
+__device__ double atomicAddDouble(double* address, double val) {
+    return atomicAdd(address, val);
+}
+#endif
+
+__global__ void BatchNormForwardTrainingKernel(LayerData layer, double* input, int n, 
+                                                double* mean, double* var, double momentum) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double x = input[i];
+        double normalized = (x - mean[0]) / sqrt(var[0] + BATCH_NORM_EPSILON);
+        double y = layer.d_Gamma[i] * normalized + layer.d_Beta[i];
+        layer.d_BatchNormOutput[i] = y;
+        
+        layer.d_RunningMean[i] = (1.0 - momentum) * layer.d_RunningMean[i] + momentum * mean[0];
+        layer.d_RunningVar[i] = (1.0 - momentum) * layer.d_RunningVar[i] + momentum * var[0];
+    }
+}
+
+__global__ void BatchNormForwardInferenceKernel(LayerData layer, double* input, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double x = input[i];
+        double normalized = (x - layer.d_RunningMean[i]) / sqrt(layer.d_RunningVar[i] + BATCH_NORM_EPSILON);
+        layer.d_BatchNormOutput[i] = layer.d_Gamma[i] * normalized + layer.d_Beta[i];
+    }
+}
+
+__global__ void BatchNormComputeMeanKernel(double* input, double* mean, int n) {
+    __shared__ double sdata[256];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    sdata[tid] = (i < n) ? input[i] : 0.0;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        atomicAddDouble(mean, sdata[0] / n);
+    }
+}
+
+__global__ void BatchNormComputeVarKernel(double* input, double* mean, double* var, int n) {
+    __shared__ double sdata[256];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    double diff = (i < n) ? (input[i] - mean[0]) : 0.0;
+    sdata[tid] = diff * diff;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        atomicAddDouble(var, sdata[0] / n);
+    }
+}
+
+__global__ void BatchNormBackwardKernel(LayerData layer, double* dOut, double* input,
+                                         double* mean, double* var, double* dGamma, 
+                                         double* dBeta, double* dInput, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        double x = input[i];
+        double mu = mean[0];
+        double sigma2 = var[0];
+        double invStd = 1.0 / sqrt(sigma2 + BATCH_NORM_EPSILON);
+        double xHat = (x - mu) * invStd;
+        
+        atomicAddDouble(dGamma, dOut[i] * xHat);
+        atomicAddDouble(dBeta, dOut[i]);
+        
+        double dxHat = dOut[i] * layer.d_Gamma[i];
+        double dVar = -0.5 * dxHat * (x - mu) * pow(sigma2 + BATCH_NORM_EPSILON, -1.5);
+        double dMu = -dxHat * invStd;
+        
+        dInput[i] = dxHat * invStd + dVar * 2.0 * (x - mu) / n + dMu / n;
+    }
+}
+
+__global__ void BatchNormUpdateParamsKernel(LayerData layer, double* dGamma, double* dBeta, 
+                                             double learningRate, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        layer.d_Gamma[i] -= learningRate * dGamma[i];
+        layer.d_Beta[i] -= learningRate * dBeta[i];
+    }
+}
+
 string ActivationToStr(TActivationType act) {
     switch (act) {
         case atSigmoid: return "sigmoid";
@@ -372,7 +494,7 @@ private:
     double* d_Target;
     double* d_SoftmaxSums;
 
-    void AllocateLayer(LayerData& layer, int numNeurons, int numInputs, TActivationType actType) {
+    void AllocateLayer(LayerData& layer, int numNeurons, int numInputs, TActivationType actType, bool batchNorm = false) {
         layer.NumNeurons = numNeurons;
         layer.NumInputs = numInputs;
         layer.ActivationType = actType;
@@ -393,6 +515,40 @@ private:
         CUDA_CHECK(cudaMemset(layer.V, 0, weightSize * sizeof(double)));
         CUDA_CHECK(cudaMemset(layer.MBias, 0, numNeurons * sizeof(double)));
         CUDA_CHECK(cudaMemset(layer.VBias, 0, numNeurons * sizeof(double)));
+
+        if (batchNorm) {
+            CUDA_CHECK(cudaMalloc(&layer.d_Gamma, numNeurons * sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&layer.d_Beta, numNeurons * sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&layer.d_RunningMean, numNeurons * sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&layer.d_RunningVar, numNeurons * sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&layer.d_BatchNormOutput, numNeurons * sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&layer.d_BatchNormMean, sizeof(double)));
+            CUDA_CHECK(cudaMalloc(&layer.d_BatchNormVar, sizeof(double)));
+            
+            double* h_gamma = new double[numNeurons];
+            double* h_beta = new double[numNeurons];
+            for (int i = 0; i < numNeurons; i++) {
+                h_gamma[i] = 1.0;
+                h_beta[i] = 0.0;
+            }
+            CUDA_CHECK(cudaMemcpy(layer.d_Gamma, h_gamma, numNeurons * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(layer.d_Beta, h_beta, numNeurons * sizeof(double), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemset(layer.d_RunningMean, 0, numNeurons * sizeof(double)));
+            double* h_var = new double[numNeurons];
+            for (int i = 0; i < numNeurons; i++) h_var[i] = 1.0;
+            CUDA_CHECK(cudaMemcpy(layer.d_RunningVar, h_var, numNeurons * sizeof(double), cudaMemcpyHostToDevice));
+            delete[] h_gamma;
+            delete[] h_beta;
+            delete[] h_var;
+        } else {
+            layer.d_Gamma = nullptr;
+            layer.d_Beta = nullptr;
+            layer.d_RunningMean = nullptr;
+            layer.d_RunningVar = nullptr;
+            layer.d_BatchNormOutput = nullptr;
+            layer.d_BatchNormMean = nullptr;
+            layer.d_BatchNormVar = nullptr;
+        }
 
         double limit;
         if (actType == atReLU)
@@ -422,6 +578,13 @@ private:
         if (layer.MBias) cudaFree(layer.MBias);
         if (layer.VBias) cudaFree(layer.VBias);
         if (layer.DropoutMask) cudaFree(layer.DropoutMask);
+        if (layer.d_Gamma) cudaFree(layer.d_Gamma);
+        if (layer.d_Beta) cudaFree(layer.d_Beta);
+        if (layer.d_RunningMean) cudaFree(layer.d_RunningMean);
+        if (layer.d_RunningVar) cudaFree(layer.d_RunningVar);
+        if (layer.d_BatchNormOutput) cudaFree(layer.d_BatchNormOutput);
+        if (layer.d_BatchNormMean) cudaFree(layer.d_BatchNormMean);
+        if (layer.d_BatchNormVar) cudaFree(layer.d_BatchNormVar);
     }
 
 public:
@@ -440,9 +603,11 @@ public:
     int LRDecayEpochs;
     bool EnableEarlyStopping;
     int EarlyStoppingPatience;
+    bool BatchNormEnabled;
 
     TMultiLayerPerceptronCUDA(int InputSize, const vector<int>& HiddenSizes, int OutputSize,
-                               TActivationType HiddenAct = atSigmoid, TActivationType OutputAct = atSigmoid) {
+                               TActivationType HiddenAct = atSigmoid, TActivationType OutputAct = atSigmoid,
+                               bool batchNorm = false) {
         LearningRate = 0.1;
         MaxIterations = 100;
         Optimizer = otSGD;
@@ -459,6 +624,7 @@ public:
         EnableEarlyStopping = false;
         EarlyStoppingPatience = 10;
         FIsTraining = true;
+        BatchNormEnabled = batchNorm;
 
         FInputSize = InputSize;
         FOutputSize = OutputSize;
@@ -469,17 +635,17 @@ public:
         memset(h_Layers, 0, NumLayers * sizeof(LayerData));
         CUDA_CHECK(cudaMalloc(&d_Layers, NumLayers * sizeof(LayerData)));
 
-        AllocateLayer(h_Layers[0], InputSize + 1, InputSize, atSigmoid);
+        AllocateLayer(h_Layers[0], InputSize + 1, InputSize, atSigmoid, false);
 
         MaxNeurons = InputSize + 1;
         int numInputs = InputSize;
         for (size_t i = 0; i < HiddenSizes.size(); i++) {
-            AllocateLayer(h_Layers[i + 1], HiddenSizes[i] + 1, numInputs + 1, HiddenActivation);
+            AllocateLayer(h_Layers[i + 1], HiddenSizes[i] + 1, numInputs + 1, HiddenActivation, batchNorm);
             if (HiddenSizes[i] + 1 > MaxNeurons) MaxNeurons = HiddenSizes[i] + 1;
             numInputs = HiddenSizes[i];
         }
 
-        AllocateLayer(h_Layers[NumLayers - 1], OutputSize, numInputs + 1, OutputActivation);
+        AllocateLayer(h_Layers[NumLayers - 1], OutputSize, numInputs + 1, OutputActivation, false);
         if (OutputSize > MaxNeurons) MaxNeurons = OutputSize;
 
         CUDA_CHECK(cudaMemcpy(d_Layers, h_Layers, NumLayers * sizeof(LayerData), cudaMemcpyHostToDevice));
@@ -503,6 +669,30 @@ public:
         cudaFree(d_SoftmaxSums);
     }
 
+    void ApplyBatchNorm(LayerData& layer, int n) {
+        int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        
+        if (FIsTraining) {
+            CUDA_CHECK(cudaMemset(layer.d_BatchNormMean, 0, sizeof(double)));
+            CUDA_CHECK(cudaMemset(layer.d_BatchNormVar, 0, sizeof(double)));
+            
+            BatchNormComputeMeanKernel<<<blocks, BLOCK_SIZE>>>(layer.Outputs, layer.d_BatchNormMean, n);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            BatchNormComputeVarKernel<<<blocks, BLOCK_SIZE>>>(layer.Outputs, layer.d_BatchNormMean, layer.d_BatchNormVar, n);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            BatchNormForwardTrainingKernel<<<blocks, BLOCK_SIZE>>>(layer, layer.Outputs, n,
+                                                                    layer.d_BatchNormMean, layer.d_BatchNormVar, 
+                                                                    BATCH_NORM_MOMENTUM);
+        } else {
+            BatchNormForwardInferenceKernel<<<blocks, BLOCK_SIZE>>>(layer, layer.Outputs, n);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        CUDA_CHECK(cudaMemcpy(layer.Outputs, layer.d_BatchNormOutput, n * sizeof(double), cudaMemcpyDeviceToDevice));
+    }
+
     void FeedForward() {
         for (int k = 1; k < NumLayers - 1; k++) {
             LayerData& layer = h_Layers[k];
@@ -510,6 +700,11 @@ public:
 
             int blocks = (layer.NumNeurons + BLOCK_SIZE - 1) / BLOCK_SIZE;
             FeedForwardKernel<<<blocks, BLOCK_SIZE>>>(layer, prevLayer.Outputs, prevLayer.NumNeurons);
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            if (BatchNormEnabled && layer.d_Gamma != nullptr) {
+                ApplyBatchNorm(layer, layer.NumNeurons);
+            }
 
             if (FIsTraining && DropoutRate > 0) {
                 double scale = 1.0 / (1.0 - DropoutRate);
@@ -675,6 +870,7 @@ public:
         f << "  \"l2_lambda\": " << L2Lambda << "," << endl;
         f << "  \"beta1\": " << Beta1 << "," << endl;
         f << "  \"beta2\": " << Beta2 << "," << endl;
+        f << "  \"batch_norm\": " << (BatchNormEnabled ? "true" : "false") << "," << endl;
         
         f << "  \"input_layer\": {" << endl;
         f << "    \"neuron_count\": " << FInputSize << endl;
@@ -826,6 +1022,17 @@ public:
         double newBeta1 = getJsonNumber("beta1");
         double newBeta2 = getJsonNumber("beta2");
         
+        bool newBatchNorm = false;
+        size_t bnPos = content.find("\"batch_norm\"");
+        if (bnPos != string::npos) {
+            size_t colonPos = content.find(":", bnPos);
+            size_t endPos = content.find_first_of(",}", colonPos);
+            string bnValue = content.substr(colonPos + 1, endPos - colonPos - 1);
+            bnValue.erase(0, bnValue.find_first_not_of(" \t\n\r"));
+            bnValue.erase(bnValue.find_last_not_of(" \t\n\r") + 1);
+            newBatchNorm = (bnValue == "true" || bnValue == "1");
+        }
+        
         vector<int> newHiddenSizes;
         size_t hiddenArrayPos = content.find("\"hidden_sizes\": [");
         if (hiddenArrayPos != string::npos) {
@@ -867,23 +1074,24 @@ public:
         L2Lambda = newL2;
         Beta1 = newBeta1;
         Beta2 = newBeta2;
+        BatchNormEnabled = newBatchNorm;
         
         NumLayers = FHiddenSizes.size() + 2;
         h_Layers = new LayerData[NumLayers];
         memset(h_Layers, 0, NumLayers * sizeof(LayerData));
         CUDA_CHECK(cudaMalloc(&d_Layers, NumLayers * sizeof(LayerData)));
 
-        AllocateLayer(h_Layers[0], FInputSize + 1, FInputSize, atSigmoid);
+        AllocateLayer(h_Layers[0], FInputSize + 1, FInputSize, atSigmoid, false);
 
         MaxNeurons = FInputSize + 1;
         int numInputs = FInputSize;
         for (size_t i = 0; i < FHiddenSizes.size(); i++) {
-            AllocateLayer(h_Layers[i + 1], FHiddenSizes[i] + 1, numInputs + 1, HiddenActivation);
+            AllocateLayer(h_Layers[i + 1], FHiddenSizes[i] + 1, numInputs + 1, HiddenActivation, newBatchNorm);
             if (FHiddenSizes[i] + 1 > MaxNeurons) MaxNeurons = FHiddenSizes[i] + 1;
             numInputs = FHiddenSizes[i];
         }
 
-        AllocateLayer(h_Layers[NumLayers - 1], FOutputSize, numInputs + 1, OutputActivation);
+        AllocateLayer(h_Layers[NumLayers - 1], FOutputSize, numInputs + 1, OutputActivation, false);
         if (FOutputSize > MaxNeurons) MaxNeurons = FOutputSize;
 
         CUDA_CHECK(cudaMemcpy(d_Layers, h_Layers, NumLayers * sizeof(LayerData), cudaMemcpyHostToDevice));
@@ -999,6 +1207,367 @@ public:
         mlp->LoadModelFromJSON(filename);
         return mlp;
     }
+
+    void WriteVarint(ofstream& f, uint64_t value) {
+        while (value > 127) {
+            f.put((value & 0x7F) | 0x80);
+            value >>= 7;
+        }
+        f.put(value & 0x7F);
+    }
+
+    void WriteLengthDelimited(ofstream& f, int fieldNum, const string& data) {
+        WriteVarint(f, (fieldNum << 3) | 2);
+        WriteVarint(f, data.size());
+        f.write(data.data(), data.size());
+    }
+
+    void WriteVarintField(ofstream& f, int fieldNum, uint64_t value) {
+        WriteVarint(f, (fieldNum << 3) | 0);
+        WriteVarint(f, value);
+    }
+
+    string BuildTensorProto(const vector<double>& data, const vector<int64_t>& dims, const string& name) {
+        stringstream ss;
+        
+        for (int64_t d : dims) {
+            uint64_t v = d;
+            while (v > 127) { ss.put((v & 0x7F) | 0x80); v >>= 7; }
+            ss.put(v & 0x7F);
+        }
+        string dimsData = ss.str();
+        ss.str("");
+        
+        ss.put((1 << 3) | 2);
+        uint64_t sz = dimsData.size();
+        while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        ss.put(sz & 0x7F);
+        ss.write(dimsData.data(), dimsData.size());
+        
+        ss.put((2 << 3) | 0);
+        ss.put(11);
+        
+        string rawData;
+        rawData.resize(data.size() * sizeof(double));
+        memcpy(&rawData[0], data.data(), data.size() * sizeof(double));
+        
+        ss.put((4 << 3) | 2);
+        sz = rawData.size();
+        while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        ss.put(sz & 0x7F);
+        ss.write(rawData.data(), rawData.size());
+        
+        ss.put((8 << 3) | 2);
+        sz = name.size();
+        while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        ss.put(sz & 0x7F);
+        ss.write(name.data(), name.size());
+        
+        return ss.str();
+    }
+
+    string BuildNodeProto(const vector<string>& inputs, const vector<string>& outputs, 
+                          const string& name, const string& opType) {
+        stringstream ss;
+        
+        for (const string& inp : inputs) {
+            ss.put((1 << 3) | 2);
+            uint64_t sz = inp.size();
+            while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+            ss.put(sz & 0x7F);
+            ss.write(inp.data(), inp.size());
+        }
+        
+        for (const string& out : outputs) {
+            ss.put((2 << 3) | 2);
+            uint64_t sz = out.size();
+            while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+            ss.put(sz & 0x7F);
+            ss.write(out.data(), out.size());
+        }
+        
+        ss.put((3 << 3) | 2);
+        uint64_t sz = name.size();
+        while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        ss.put(sz & 0x7F);
+        ss.write(name.data(), name.size());
+        
+        ss.put((4 << 3) | 2);
+        sz = opType.size();
+        while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        ss.put(sz & 0x7F);
+        ss.write(opType.data(), opType.size());
+        
+        return ss.str();
+    }
+
+    string BuildValueInfoProto(const string& name, int elemType, const vector<int64_t>& dims) {
+        stringstream ss;
+        
+        stringstream dimProto;
+        for (int64_t d : dims) {
+            stringstream dimVal;
+            dimVal.put((1 << 3) | 0);
+            uint64_t v = d;
+            while (v > 127) { dimVal.put((v & 0x7F) | 0x80); v >>= 7; }
+            dimVal.put(v & 0x7F);
+            string dv = dimVal.str();
+            dimProto.put((1 << 3) | 2);
+            uint64_t sz = dv.size();
+            while (sz > 127) { dimProto.put((sz & 0x7F) | 0x80); sz >>= 7; }
+            dimProto.put(sz & 0x7F);
+            dimProto.write(dv.data(), dv.size());
+        }
+        string shapeData = dimProto.str();
+        
+        stringstream shapeProto;
+        shapeProto.put((7 << 3) | 2);
+        uint64_t sz = shapeData.size();
+        while (sz > 127) { shapeProto.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        shapeProto.put(sz & 0x7F);
+        shapeProto.write(shapeData.data(), shapeData.size());
+        string tensorShapeData = shapeProto.str();
+        
+        stringstream tensorType;
+        tensorType.put((1 << 3) | 0);
+        tensorType.put(elemType);
+        tensorType.put((2 << 3) | 2);
+        sz = tensorShapeData.size();
+        while (sz > 127) { tensorType.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        tensorType.put(sz & 0x7F);
+        tensorType.write(tensorShapeData.data(), tensorShapeData.size());
+        string tensorTypeData = tensorType.str();
+        
+        stringstream typeProto;
+        typeProto.put((1 << 3) | 2);
+        sz = tensorTypeData.size();
+        while (sz > 127) { typeProto.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        typeProto.put(sz & 0x7F);
+        typeProto.write(tensorTypeData.data(), tensorTypeData.size());
+        string typeData = typeProto.str();
+        
+        ss.put((1 << 3) | 2);
+        sz = name.size();
+        while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        ss.put(sz & 0x7F);
+        ss.write(name.data(), name.size());
+        
+        ss.put((2 << 3) | 2);
+        sz = typeData.size();
+        while (sz > 127) { ss.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        ss.put(sz & 0x7F);
+        ss.write(typeData.data(), typeData.size());
+        
+        return ss.str();
+    }
+
+    void ExportToONNX(const string& filename) {
+        ofstream f(filename, ios::binary);
+        if (!f.is_open()) {
+            throw runtime_error("Could not create ONNX file: " + filename);
+        }
+
+        vector<string> initializers;
+        vector<string> nodes;
+        
+        string prevOutput = "input";
+        int nodeIdx = 0;
+        
+        for (size_t layerIdx = 1; layerIdx < (size_t)NumLayers; layerIdx++) {
+            LayerData& layer = h_Layers[layerIdx];
+            int numNeurons = (layerIdx < (size_t)(NumLayers - 1)) ? FHiddenSizes[layerIdx - 1] : FOutputSize;
+            int numInputs = (layerIdx == 1) ? FInputSize : FHiddenSizes[layerIdx - 2];
+            
+            double* h_weights = new double[layer.NumNeurons * layer.NumInputs];
+            double* h_biases = new double[layer.NumNeurons];
+            CUDA_CHECK(cudaMemcpy(h_weights, layer.Weights, layer.NumNeurons * layer.NumInputs * sizeof(double), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h_biases, layer.Biases, layer.NumNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+            
+            vector<double> weightsT(numInputs * numNeurons);
+            for (int i = 0; i < numNeurons; i++) {
+                for (int j = 0; j < numInputs; j++) {
+                    weightsT[j * numNeurons + i] = h_weights[i * layer.NumInputs + j];
+                }
+            }
+            
+            string wName = "layer" + to_string(layerIdx) + "_weights";
+            string bName = "layer" + to_string(layerIdx) + "_bias";
+            
+            vector<double> biasVec(h_biases, h_biases + numNeurons);
+            initializers.push_back(BuildTensorProto(weightsT, {numInputs, numNeurons}, wName));
+            initializers.push_back(BuildTensorProto(biasVec, {numNeurons}, bName));
+            
+            string matmulOut = "matmul_" + to_string(nodeIdx);
+            nodes.push_back(BuildNodeProto({prevOutput, wName}, {matmulOut}, "MatMul_" + to_string(nodeIdx), "MatMul"));
+            nodeIdx++;
+            
+            string addOut = "add_" + to_string(nodeIdx);
+            nodes.push_back(BuildNodeProto({matmulOut, bName}, {addOut}, "Add_" + to_string(nodeIdx), "Add"));
+            nodeIdx++;
+            
+            if (BatchNormEnabled && layer.d_Gamma != nullptr && layerIdx < (size_t)(NumLayers - 1)) {
+                double* h_gamma = new double[numNeurons];
+                double* h_beta = new double[numNeurons];
+                double* h_mean = new double[numNeurons];
+                double* h_var = new double[numNeurons];
+                CUDA_CHECK(cudaMemcpy(h_gamma, layer.d_Gamma, numNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_beta, layer.d_Beta, numNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_mean, layer.d_RunningMean, numNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_var, layer.d_RunningVar, numNeurons * sizeof(double), cudaMemcpyDeviceToHost));
+                
+                string gName = "layer" + to_string(layerIdx) + "_bn_gamma";
+                string betaName = "layer" + to_string(layerIdx) + "_bn_beta";
+                string meanName = "layer" + to_string(layerIdx) + "_bn_mean";
+                string varName = "layer" + to_string(layerIdx) + "_bn_var";
+                
+                initializers.push_back(BuildTensorProto(vector<double>(h_gamma, h_gamma + numNeurons), {numNeurons}, gName));
+                initializers.push_back(BuildTensorProto(vector<double>(h_beta, h_beta + numNeurons), {numNeurons}, betaName));
+                initializers.push_back(BuildTensorProto(vector<double>(h_mean, h_mean + numNeurons), {numNeurons}, meanName));
+                initializers.push_back(BuildTensorProto(vector<double>(h_var, h_var + numNeurons), {numNeurons}, varName));
+                
+                string bnOut = "bn_" + to_string(nodeIdx);
+                nodes.push_back(BuildNodeProto({addOut, gName, betaName, meanName, varName}, {bnOut}, "BatchNorm_" + to_string(nodeIdx), "BatchNormalization"));
+                nodeIdx++;
+                addOut = bnOut;
+                
+                delete[] h_gamma;
+                delete[] h_beta;
+                delete[] h_mean;
+                delete[] h_var;
+            }
+            
+            TActivationType actType = (layerIdx < (size_t)(NumLayers - 1)) ? HiddenActivation : OutputActivation;
+            string actOut = (layerIdx == (size_t)(NumLayers - 1)) ? "output" : ("act_" + to_string(nodeIdx));
+            
+            string opType;
+            switch (actType) {
+                case atSigmoid: opType = "Sigmoid"; break;
+                case atTanh: opType = "Tanh"; break;
+                case atReLU: opType = "Relu"; break;
+                case atSoftmax: opType = "Softmax"; break;
+                case atLinear: opType = "Identity"; break;
+                default: opType = "Sigmoid"; break;
+            }
+            
+            nodes.push_back(BuildNodeProto({addOut}, {actOut}, opType + "_" + to_string(nodeIdx), opType));
+            nodeIdx++;
+            
+            prevOutput = actOut;
+            
+            delete[] h_weights;
+            delete[] h_biases;
+        }
+        
+        stringstream graphStream;
+        
+        for (const string& node : nodes) {
+            graphStream.put((1 << 3) | 2);
+            uint64_t sz = node.size();
+            while (sz > 127) { graphStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+            graphStream.put(sz & 0x7F);
+            graphStream.write(node.data(), node.size());
+        }
+        
+        string graphName = "mlp_graph";
+        graphStream.put((2 << 3) | 2);
+        uint64_t sz = graphName.size();
+        while (sz > 127) { graphStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        graphStream.put(sz & 0x7F);
+        graphStream.write(graphName.data(), graphName.size());
+        
+        for (const string& init : initializers) {
+            graphStream.put((5 << 3) | 2);
+            sz = init.size();
+            while (sz > 127) { graphStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+            graphStream.put(sz & 0x7F);
+            graphStream.write(init.data(), init.size());
+        }
+        
+        string inputInfo = BuildValueInfoProto("input", 11, {1, FInputSize});
+        graphStream.put((11 << 3) | 2);
+        sz = inputInfo.size();
+        while (sz > 127) { graphStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        graphStream.put(sz & 0x7F);
+        graphStream.write(inputInfo.data(), inputInfo.size());
+        
+        string outputInfo = BuildValueInfoProto("output", 11, {1, FOutputSize});
+        graphStream.put((12 << 3) | 2);
+        sz = outputInfo.size();
+        while (sz > 127) { graphStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        graphStream.put(sz & 0x7F);
+        graphStream.write(outputInfo.data(), outputInfo.size());
+        
+        string graphData = graphStream.str();
+        
+        stringstream opsetStream;
+        opsetStream.put((2 << 3) | 0);
+        opsetStream.put(13);
+        string opsetData = opsetStream.str();
+        
+        stringstream modelStream;
+        
+        modelStream.put((1 << 3) | 0);
+        modelStream.put(7);
+        
+        modelStream.put((8 << 3) | 2);
+        sz = opsetData.size();
+        while (sz > 127) { modelStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        modelStream.put(sz & 0x7F);
+        modelStream.write(opsetData.data(), opsetData.size());
+        
+        string producerName = "GlassBoxAI-MLP";
+        modelStream.put((2 << 3) | 2);
+        sz = producerName.size();
+        while (sz > 127) { modelStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        modelStream.put(sz & 0x7F);
+        modelStream.write(producerName.data(), producerName.size());
+        
+        modelStream.put((7 << 3) | 2);
+        sz = graphData.size();
+        while (sz > 127) { modelStream.put((sz & 0x7F) | 0x80); sz >>= 7; }
+        modelStream.put(sz & 0x7F);
+        modelStream.write(graphData.data(), graphData.size());
+        
+        string modelData = modelStream.str();
+        f.write(modelData.data(), modelData.size());
+        f.close();
+    }
+
+    vector<pair<int, double>> CalculateFeatureImportance() {
+        vector<pair<int, double>> importance(FInputSize);
+        
+        if (NumLayers < 2) {
+            for (int i = 0; i < FInputSize; i++) {
+                importance[i] = {i, 0.0};
+            }
+            return importance;
+        }
+        
+        LayerData& firstHidden = h_Layers[1];
+        int numNeurons = FHiddenSizes.empty() ? FOutputSize : FHiddenSizes[0];
+        
+        double* h_weights = new double[firstHidden.NumNeurons * firstHidden.NumInputs];
+        CUDA_CHECK(cudaMemcpy(h_weights, firstHidden.Weights, 
+                              firstHidden.NumNeurons * firstHidden.NumInputs * sizeof(double), 
+                              cudaMemcpyDeviceToHost));
+        
+        for (int i = 0; i < FInputSize; i++) {
+            double sum = 0.0;
+            for (int j = 0; j < numNeurons; j++) {
+                sum += fabs(h_weights[j * firstHidden.NumInputs + i]);
+            }
+            importance[i] = {i, sum};
+        }
+        
+        delete[] h_weights;
+        
+        sort(importance.begin(), importance.end(), 
+             [](const pair<int, double>& a, const pair<int, double>& b) {
+                 return a.second > b.second;
+             });
+        
+        return importance;
+    }
 };
 
 void ShuffleData(TDataPointArray& data) {
@@ -1058,11 +1627,13 @@ void PrintUsage() {
     cout << "Usage: mlp <command> [options]" << endl;
     cout << endl;
     cout << "Commands:" << endl;
-    cout << "  create   Create a new MLP model" << endl;
-    cout << "  train    Train an existing model" << endl;
-    cout << "  predict  Make predictions with a model" << endl;
-    cout << "  info     Display model information" << endl;
-    cout << "  help     Show this help message" << endl;
+    cout << "  create            Create a new MLP model" << endl;
+    cout << "  train             Train an existing model" << endl;
+    cout << "  predict           Make predictions with a model" << endl;
+    cout << "  info              Display model information" << endl;
+    cout << "  export-onnx       Export model to ONNX format" << endl;
+    cout << "  feature-importance Calculate and display feature importance" << endl;
+    cout << "  help              Show this help message" << endl;
     cout << endl;
     cout << "Create Options:" << endl;
     cout << "  -i, --input=N              Input layer size (required)" << endl;
@@ -1077,6 +1648,7 @@ void PrintUsage() {
     cout << "  --l2=VALUE                 L2 regularization lambda (default: 0)" << endl;
     cout << "  --beta1=VALUE              Adam beta1 parameter (default: 0.9)" << endl;
     cout << "  --beta2=VALUE              Adam beta2 parameter (default: 0.999)" << endl;
+    cout << "  --batch-norm               Enable batch normalization" << endl;
     cout << endl;
     cout << "Train Options:" << endl;
     cout << "  -m, --model=FILE           Load model file (required, .json)" << endl;
@@ -1100,13 +1672,23 @@ void PrintUsage() {
     cout << "Info Options:" << endl;
     cout << "  -m, --model=FILE           Model file (required, .json)" << endl;
     cout << endl;
+    cout << "Export ONNX Options:" << endl;
+    cout << "  -m, --model=FILE           Model file (required, .json)" << endl;
+    cout << "  -o, --output=FILE          Output ONNX file (required, .onnx)" << endl;
+    cout << "  --onnx=FILE                Alternative: specify output ONNX file" << endl;
+    cout << endl;
+    cout << "Feature Importance Options:" << endl;
+    cout << "  -m, --model=FILE           Model file (required, .json)" << endl;
+    cout << endl;
     cout << "Examples:" << endl;
     cout << "  mlp create -i 2 -H 8 -o 1 -s xor.json" << endl;
-    cout << "  mlp create --input=2 --hidden=8,8 --output=1 --save=xor.json" << endl;
+    cout << "  mlp create --input=2 --hidden=8,8 --output=1 --save=xor.json --batch-norm" << endl;
     cout << "  mlp train -m xor.json -d data.csv -s xor_trained.json --epochs=1000" << endl;
     cout << "  mlp train --model=xor.json --data=data.csv --epochs=1000 --save=xor_trained.json --verbose" << endl;
     cout << "  mlp predict -m xor_trained.json -i 1,0" << endl;
     cout << "  mlp info -m xor_trained.json" << endl;
+    cout << "  mlp export-onnx -m xor_trained.json -o model.onnx" << endl;
+    cout << "  mlp feature-importance -m xor_trained.json" << endl;
     cout << endl;
     cout << "Exit codes:" << endl;
     cout << "  0 - Success" << endl;
@@ -1129,6 +1711,8 @@ int main(int argc, char* argv[]) {
     else if (cmdStr == "train") command = cmdTrain;
     else if (cmdStr == "predict") command = cmdPredict;
     else if (cmdStr == "info") command = cmdInfo;
+    else if (cmdStr == "export-onnx") command = cmdExportONNX;
+    else if (cmdStr == "feature-importance") command = cmdFeatureImportance;
     else if (cmdStr == "help" || cmdStr == "--help" || cmdStr == "-h") command = cmdHelp;
     else {
         cerr << "Error: Unknown command: " << cmdStr << endl;
@@ -1164,7 +1748,9 @@ int main(int argc, char* argv[]) {
     string modelFile = "";
     string saveFile = "";
     string dataFile = "";
+    string onnxFile = "";
     TDoubleArray inputValues;
+    bool batchNorm = false;
     
     int i = 2;
     while (i < argc) {
@@ -1183,6 +1769,9 @@ int main(int argc, char* argv[]) {
             i++;
         } else if (arg == "--verbose") {
             verbose = true;
+            i++;
+        } else if (arg == "--batch-norm") {
+            batchNorm = true;
             i++;
         } else if (arg == "-h") {
             PrintUsage();
@@ -1229,7 +1818,11 @@ int main(int argc, char* argv[]) {
                 ParseIntArrayHelper(value, hiddenSizes);
             }
             else if (key == "--output" || key == "-o") {
-                outputSize = stoi(value);
+                if (command == cmdExportONNX) {
+                    onnxFile = value;
+                } else {
+                    outputSize = stoi(value);
+                }
             }
             else if (key == "--save" || key == "-s") {
                 saveFile = value;
@@ -1279,6 +1872,9 @@ int main(int argc, char* argv[]) {
             else if (key == "--patience") {
                 patience = stoi(value);
             }
+            else if (key == "--onnx") {
+                onnxFile = value;
+            }
             else if (key != "") {
                 cerr << "Error: Unknown option: " << key << endl;
             }
@@ -1302,7 +1898,7 @@ int main(int argc, char* argv[]) {
             if (outputSize <= 0) { cerr << "Error: --output (-o) is required" << endl; return 1; }
             if (saveFile.empty()) { cerr << "Error: --save (-s) is required" << endl; return 1; }
             
-            TMultiLayerPerceptronCUDA mlp(inputSize, hiddenSizes, outputSize, hiddenAct, outputAct);
+            TMultiLayerPerceptronCUDA mlp(inputSize, hiddenSizes, outputSize, hiddenAct, outputAct, batchNorm);
             mlp.LearningRate = learningRate;
             mlp.Optimizer = optimizer;
             mlp.DropoutRate = dropoutRate;
@@ -1328,6 +1924,7 @@ int main(int argc, char* argv[]) {
             cout << "  Dropout rate: " << dropoutRate << endl;
             cout << setprecision(6);
             cout << "  L2 lambda: " << l2Lambda << endl;
+            cout << "  Batch normalization: " << (batchNorm ? "enabled" : "disabled") << endl;
             
             mlp.SaveModelToJSON(saveFile);
             cout << "Model saved to JSON: " << saveFile << endl;
@@ -1424,6 +2021,41 @@ int main(int argc, char* argv[]) {
             for (size_t i = 0; i < mlp.GetHiddenSizes().size(); i++)
                 cout << "  Layer " << (i + 1) << ": " << mlp.GetHiddenSizes()[i] << " neurons" << endl;
             cout << "  Layer " << (mlp.GetHiddenLayerCount() + 1) << ": " << mlp.GetOutputSize() << " neurons (output)" << endl;
+            cout << "  Batch normalization: " << (mlp.BatchNormEnabled ? "enabled" : "disabled") << endl;
+            
+            return 0;
+        }
+        else if (command == cmdExportONNX) {
+            if (modelFile.empty()) { cerr << "Error: --model (-m) is required" << endl; return 1; }
+            if (onnxFile.empty()) { cerr << "Error: --output (-o) is required" << endl; return 1; }
+            
+            TMultiLayerPerceptronCUDA mlp(1, {1}, 1, atSigmoid, atSigmoid);
+            mlp.LoadModelFromJSON(modelFile);
+            
+            mlp.ExportToONNX(onnxFile);
+            cout << "Model exported to ONNX: " << onnxFile << endl;
+            return 0;
+        }
+        else if (command == cmdFeatureImportance) {
+            if (modelFile.empty()) { cerr << "Error: --model (-m) is required" << endl; return 1; }
+            
+            TMultiLayerPerceptronCUDA mlp(1, {1}, 1, atSigmoid, atSigmoid);
+            mlp.LoadModelFromJSON(modelFile);
+            
+            vector<pair<int, double>> importance = mlp.CalculateFeatureImportance();
+            
+            cout << "Feature Importance (ranked by weight magnitude from first hidden layer):" << endl;
+            cout << "========================================================================" << endl;
+            cout << fixed << setprecision(6);
+            
+            double maxScore = importance.empty() ? 1.0 : importance[0].second;
+            for (const auto& fi : importance) {
+                double normalizedScore = (maxScore > 0) ? (fi.second / maxScore) * 100.0 : 0.0;
+                cout << "  Feature " << setw(4) << fi.first << ": " 
+                     << setw(12) << fi.second << " (normalized: " 
+                     << setprecision(2) << setw(6) << normalizedScore << "%)" << endl;
+                cout << setprecision(6);
+            }
             
             return 0;
         }

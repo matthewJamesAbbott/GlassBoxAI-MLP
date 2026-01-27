@@ -225,6 +225,55 @@ __global__ void UpdateWeightsRMSPropKernel(
     }
 }
 
+__global__ void BatchNormForwardKernel(
+    double* outputs, double* gamma, double* beta,
+    double* runningMean, double* runningVar,
+    double* batchMean, double* batchVar,
+    int numNeurons, int isTraining, double momentum, double epsilon
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numNeurons) {
+        double mean, var;
+        if (isTraining) {
+            mean = batchMean[i];
+            var = batchVar[i];
+            runningMean[i] = (1.0 - momentum) * runningMean[i] + momentum * mean;
+            runningVar[i] = (1.0 - momentum) * runningVar[i] + momentum * var;
+        } else {
+            mean = runningMean[i];
+            var = runningVar[i];
+        }
+        double normalized = (outputs[i] - mean) / sqrt(var + epsilon);
+        outputs[i] = gamma[i] * normalized + beta[i];
+    }
+}
+
+__global__ void BatchNormBackwardKernel(
+    double* errors, double* outputs, double* gamma,
+    double* dGamma, double* dBeta,
+    double* batchMean, double* batchVar,
+    int numNeurons, double epsilon
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numNeurons) {
+        double normalized = (outputs[i] - batchMean[i]) / sqrt(batchVar[i] + epsilon);
+        dGamma[i] = errors[i] * normalized;
+        dBeta[i] = errors[i];
+        errors[i] = errors[i] * gamma[i] / sqrt(batchVar[i] + epsilon);
+    }
+}
+
+__global__ void ComputeBatchStatsKernel(
+    double* outputs, double* batchMean, double* batchVar,
+    int numNeurons
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < numNeurons) {
+        batchMean[i] = outputs[i];
+        batchVar[i] = 0.0;
+    }
+}
+
 } // extern "C"
 "#;
 
@@ -238,4 +287,7 @@ pub const KERNEL_NAMES: &[&str] = &[
     "UpdateWeightsSGDKernel",
     "UpdateWeightsAdamKernel",
     "UpdateWeightsRMSPropKernel",
+    "BatchNormForwardKernel",
+    "BatchNormBackwardKernel",
+    "ComputeBatchStatsKernel",
 ];

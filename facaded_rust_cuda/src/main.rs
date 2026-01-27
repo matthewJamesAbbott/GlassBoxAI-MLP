@@ -16,6 +16,7 @@ pub const MODEL_MAGIC: &str = "MLPCUDA1";
 mod kernels;
 mod mlp;
 mod cli;
+mod onnx;
 
 fn main() {
     cli::run();

@@ -20,7 +20,7 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- */.
+ */
 
 #define CL_TARGET_OPENCL_VERSION 200
 
@@ -40,13 +40,18 @@ using namespace std;
 const double EPSILON = 1e-15;
 const string MODEL_MAGIC = "MLPBKND01";
 
+// Batch normalization constants
+const double BN_MOMENTUM = 0.1;
+const double BN_EPSILON = 1e-5;
+
 // Enums
 enum TActivationType { atSigmoid, atTanh, atReLU, atSoftmax, atLinear };
 enum TOptimizerType { otSGD, otAdam, otRMSProp };
 enum TCommand { cmdNone, cmdCreate, cmdTrain, cmdPredict, cmdInfo, cmdHelp,
                 cmdGetWeight, cmdSetWeight, cmdGetWeights, cmdGetBias, cmdSetBias,
                 cmdGetOutput, cmdGetError, cmdLayerInfo, cmdHistogram,
-                cmdGetOptimizer, cmdBatchPredict };
+                cmdGetOptimizer, cmdBatchPredict, cmdExportONNX, cmdImportONNX,
+                cmdFeatureImportance };
 
 // Type aliases
 typedef vector<double> Darray;
@@ -75,6 +80,14 @@ struct TLayer {
     vector<TNeuron> Neurons;
     TActivationType ActivationType;
     vector<bool> DropoutMask;
+    // Batch normalization parameters
+    Darray Gamma;        // Scale parameter
+    Darray Beta;         // Shift parameter
+    Darray RunningMean;  // Running mean for inference
+    Darray RunningVar;   // Running variance for inference
+    Darray BNCache;      // Cache for backprop (normalized values)
+    Darray MeanCache;    // Cache for backprop (batch mean)
+    Darray VarCache;     // Cache for backprop (batch variance)
 };
 
 // OpenCL Kernel source
@@ -139,6 +152,24 @@ __kernel void softmaxKernel(
         }
     }
 }
+
+__kernel void batchNormForwardKernel(
+    __global const double* input,
+    __global const double* gamma,
+    __global const double* beta,
+    __global const double* runningMean,
+    __global const double* runningVar,
+    __global double* output,
+    int size,
+    double epsilon)
+{
+    int idx = get_global_id(0);
+    
+    if (idx < size) {
+        double normalized = (input[idx] - runningMean[idx]) / sqrt(runningVar[idx] + epsilon);
+        output[idx] = gamma[idx] * normalized + beta[idx];
+    }
+}
 )";
 
 // Activation Functions
@@ -189,6 +220,85 @@ Darray Softmax(const Darray& x) {
     }
     
     return result;
+}
+
+// Batch Normalization forward pass (CPU)
+Darray BatchNormForward(const Darray& input, Darray& gamma, Darray& beta,
+                        Darray& runningMean, Darray& runningVar,
+                        Darray& cache, Darray& meanCache, Darray& varCache,
+                        bool isTraining) {
+    size_t n = input.size();
+    Darray output(n);
+    
+    if (isTraining) {
+        double mean = 0.0;
+        for (size_t i = 0; i < n; i++) mean += input[i];
+        mean /= n;
+        
+        double var = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            double diff = input[i] - mean;
+            var += diff * diff;
+        }
+        var /= n;
+        
+        cache.resize(n);
+        meanCache.resize(1);
+        varCache.resize(1);
+        meanCache[0] = mean;
+        varCache[0] = var;
+        
+        for (size_t i = 0; i < n; i++) {
+            cache[i] = (input[i] - mean) / sqrt(var + BN_EPSILON);
+            output[i] = gamma[i] * cache[i] + beta[i];
+        }
+        
+        for (size_t i = 0; i < n; i++) {
+            runningMean[i] = (1.0 - BN_MOMENTUM) * runningMean[i] + BN_MOMENTUM * mean;
+            runningVar[i] = (1.0 - BN_MOMENTUM) * runningVar[i] + BN_MOMENTUM * var;
+        }
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            double normalized = (input[i] - runningMean[i]) / sqrt(runningVar[i] + BN_EPSILON);
+            output[i] = gamma[i] * normalized + beta[i];
+        }
+    }
+    
+    return output;
+}
+
+// Batch Normalization backward pass (CPU)
+void BatchNormBackward(const Darray& dout, const Darray& cache, double mean, double var,
+                       const Darray& gamma, Darray& dinput, Darray& dgamma, Darray& dbeta) {
+    size_t n = dout.size();
+    dinput.resize(n);
+    dgamma.resize(n);
+    dbeta.resize(n);
+    
+    double dvar = 0.0;
+    double dmean = 0.0;
+    double invStd = 1.0 / sqrt(var + BN_EPSILON);
+    
+    for (size_t i = 0; i < n; i++) {
+        dgamma[i] = dout[i] * cache[i];
+        dbeta[i] = dout[i];
+    }
+    
+    for (size_t i = 0; i < n; i++) {
+        double dnorm = dout[i] * gamma[i];
+        dvar += dnorm * cache[i] * (-0.5) * pow(var + BN_EPSILON, -1.5);
+    }
+    
+    for (size_t i = 0; i < n; i++) {
+        double dnorm = dout[i] * gamma[i];
+        dmean += dnorm * (-invStd);
+    }
+    dmean += dvar * (-2.0 / n) * 0.0;
+    
+    for (size_t i = 0; i < n; i++) {
+        double dnorm = dout[i] * gamma[i];
+        dinput[i] = dnorm * invStd + dvar * 2.0 * cache[i] / n + dmean / n;
+    }
 }
 
 double ApplyActivation(double x, TActivationType actType) {
@@ -350,10 +460,11 @@ public:
     cl_program program;
     cl_kernel kernelFeedForward;
     cl_kernel kernelSoftmax;
+    cl_kernel kernelBatchNorm;
     
     TOpenCLContext() : platform(nullptr), device(nullptr), context(nullptr), 
                       queue(nullptr), program(nullptr), kernelFeedForward(nullptr), 
-                      kernelSoftmax(nullptr) {
+                      kernelSoftmax(nullptr), kernelBatchNorm(nullptr) {
         cl_int err;
         cl_uint numPlatforms = 0;
         
@@ -401,12 +512,16 @@ public:
             
             kernelSoftmax = clCreateKernel(program, "softmaxKernel", &err);
             if (err != CL_SUCCESS) throw runtime_error("Failed to create softmaxKernel kernel");
+            
+            kernelBatchNorm = clCreateKernel(program, "batchNormForwardKernel", &err);
+            if (err != CL_SUCCESS) throw runtime_error("Failed to create batchNormForwardKernel kernel");
         } catch (const exception& e) {
             // Silently fail and continue with CPU fallback
             // OpenCL initialization is optional; CPU computation works fine
             // Clean up any partially initialized resources
             if (kernelFeedForward) clReleaseKernel(kernelFeedForward);
             if (kernelSoftmax) clReleaseKernel(kernelSoftmax);
+            if (kernelBatchNorm) clReleaseKernel(kernelBatchNorm);
             if (program) clReleaseProgram(program);
             if (queue) clReleaseCommandQueue(queue);
             if (context) clReleaseContext(context);
@@ -417,6 +532,7 @@ public:
     ~TOpenCLContext() {
         if (kernelFeedForward) clReleaseKernel(kernelFeedForward);
         if (kernelSoftmax) clReleaseKernel(kernelSoftmax);
+        if (kernelBatchNorm) clReleaseKernel(kernelBatchNorm);
         if (program) clReleaseProgram(program);
         if (queue) clReleaseCommandQueue(queue);
         if (context) clReleaseContext(context);
@@ -463,10 +579,11 @@ public:
     bool EnableEarlyStopping;
     int EarlyStoppingPatience;
     bool UseGPU;
+    bool UseBatchNorm;
     
     TMultiLayerPerceptron(int inputSize, const TIntArray& hiddenSizes, int outputSize,
                           TActivationType hiddenAct = atSigmoid, TActivationType outputAct = atSigmoid,
-                          bool useGPU = true);
+                          bool useGPU = true, bool useBatchNorm = false);
     ~TMultiLayerPerceptron();
     
     Darray Predict(const Darray& input);
@@ -478,23 +595,28 @@ public:
     void SaveModelToJSON(const string& filename);
     void LoadModelFromJSON(const string& filename);
     string Array1DToJSON(const Darray& arr);
+    void ExportToONNX(const string& filename);
+    void ImportFromONNX(const string& filename);
+    Darray GetFeatureImportance();
     
     TLayer GetInputLayer() const { return FInputLayer; }
     TLayer GetOutputLayer() const { return FOutputLayer; }
+    TLayer& GetHiddenLayerRef(int index);
     TLayer GetHiddenLayer(int index) const;
     int GetHiddenLayerCount() const { return FHiddenLayers.size(); }
     int GetInputSize() const { return FInputSize; }
     int GetOutputSize() const { return FOutputSize; }
+    bool GetUseBatchNorm() const { return UseBatchNorm; }
 };
 
 TMultiLayerPerceptron::TMultiLayerPerceptron(int inputSize, const TIntArray& hiddenSizes, int outputSize,
-                                              TActivationType hiddenAct, TActivationType outputAct, bool useGPU)
+                                              TActivationType hiddenAct, TActivationType outputAct, bool useGPU, bool useBatchNorm)
      : FInputSize(inputSize), FOutputSize(outputSize), FIsTraining(false), UseGPU(false),  // Force CPU mode - OpenCL support needs more debugging
       LearningRate(0.1), MaxIterations(100), Optimizer(otSGD),
       HiddenActivation(hiddenAct), OutputActivation(outputAct),
       DropoutRate(0.0), L2Lambda(0.0), Beta1(0.9), Beta2(0.999),
       Timestep(0), EnableLRDecay(false), LRDecayRate(0.95), LRDecayEpochs(10),
-      EnableEarlyStopping(false), EarlyStoppingPatience(10) {
+      EnableEarlyStopping(false), EarlyStoppingPatience(10), UseBatchNorm(useBatchNorm) {
     
     FHiddenSizes = hiddenSizes;
     FOpenCL = nullptr;
@@ -515,6 +637,14 @@ TMultiLayerPerceptron::TMultiLayerPerceptron(int inputSize, const TIntArray& hid
     for (size_t i = 0; i < hiddenSizes.size(); i++) {
         int numInputs = (i == 0) ? inputSize : hiddenSizes[i-1];
         InitializeLayer(FHiddenLayers[i], hiddenSizes[i], numInputs, hiddenAct);
+        
+        if (UseBatchNorm) {
+            int layerSize = hiddenSizes[i];
+            FHiddenLayers[i].Gamma.resize(layerSize, 1.0);
+            FHiddenLayers[i].Beta.resize(layerSize, 0.0);
+            FHiddenLayers[i].RunningMean.resize(layerSize, 0.0);
+            FHiddenLayers[i].RunningVar.resize(layerSize, 1.0);
+        }
     }
     
     int outputLayerInput = hiddenSizes.empty() ? inputSize : hiddenSizes.back();
@@ -874,6 +1004,7 @@ void TMultiLayerPerceptron::SaveModelToJSON(const string& filename) {
     f << "  \"l2_lambda\": " << L2Lambda << "," << endl;
     f << "  \"beta1\": " << Beta1 << "," << endl;
     f << "  \"beta2\": " << Beta2 << "," << endl;
+    f << "  \"batch_norm\": " << (UseBatchNorm ? "true" : "false") << "," << endl;
     
     f << "  \"input_layer\": {" << endl;
     f << "    \"neuron_count\": " << FInputLayer.Neurons.size() << endl;
@@ -899,7 +1030,15 @@ void TMultiLayerPerceptron::SaveModelToJSON(const string& filename) {
             if (j > 0) f << ",";
             f << fixed << setprecision(10) << FHiddenLayers[h].Neurons[j].Bias;
         }
-        f << "]" << endl;
+        f << "]";
+        if (UseBatchNorm) {
+            f << "," << endl;
+            f << "      \"bn_gamma\": " << Array1DToJSON(FHiddenLayers[h].Gamma) << "," << endl;
+            f << "      \"bn_beta\": " << Array1DToJSON(FHiddenLayers[h].Beta) << "," << endl;
+            f << "      \"bn_running_mean\": " << Array1DToJSON(FHiddenLayers[h].RunningMean) << "," << endl;
+            f << "      \"bn_running_var\": " << Array1DToJSON(FHiddenLayers[h].RunningVar);
+        }
+        f << endl;
         f << "    }";
         if (h < FHiddenLayers.size() - 1) f << ",";
         f << endl;
@@ -993,6 +1132,17 @@ void TMultiLayerPerceptron::LoadModelFromJSON(const string& filename) {
     Beta1 = getJsonNumber("beta1");
     Beta2 = getJsonNumber("beta2");
     
+    UseBatchNorm = false;
+    size_t bnPos = content.find("\"batch_norm\":");
+    if (bnPos != string::npos) {
+        size_t colonPos = content.find(":", bnPos);
+        size_t endPos = content.find_first_of(",}", colonPos);
+        string bnValue = content.substr(colonPos + 1, endPos - colonPos - 1);
+        bnValue.erase(0, bnValue.find_first_not_of(" \t\n\r"));
+        bnValue.erase(bnValue.find_last_not_of(" \t\n\r") + 1);
+        UseBatchNorm = (bnValue == "true");
+    }
+    
     FHiddenSizes.clear();
     size_t hiddenArrayPos = content.find("\"hidden_sizes\": [");
     if (hiddenArrayPos != string::npos) {
@@ -1049,6 +1199,14 @@ void TMultiLayerPerceptron::LoadModelFromJSON(const string& filename) {
         }
         FHiddenLayers[i].ActivationType = HiddenActivation;
         FHiddenLayers[i].DropoutMask.resize(FHiddenSizes[i]);
+        
+        if (UseBatchNorm) {
+            int layerSize = FHiddenSizes[i];
+            FHiddenLayers[i].Gamma.resize(layerSize, 1.0);
+            FHiddenLayers[i].Beta.resize(layerSize, 0.0);
+            FHiddenLayers[i].RunningMean.resize(layerSize, 0.0);
+            FHiddenLayers[i].RunningVar.resize(layerSize, 1.0);
+        }
     }
     
     int outputLayerInput = FHiddenSizes.empty() ? FInputSize : FHiddenSizes.back();
@@ -1095,6 +1253,40 @@ void TMultiLayerPerceptron::LoadModelFromJSON(const string& filename) {
                     searchPos = bEnd + 1;
                 }
             }
+            
+            if (UseBatchNorm) {
+                size_t gammaPos = content.find("\"bn_gamma\": [", searchPos);
+                if (gammaPos != string::npos && gammaPos < hiddenEnd) {
+                    size_t gammaEnd = content.find("]", gammaPos);
+                    string gammaStr = content.substr(gammaPos, gammaEnd - gammaPos + 1);
+                    FHiddenLayers[h].Gamma = parseArray(gammaStr);
+                    searchPos = gammaEnd + 1;
+                }
+                
+                size_t betaPos = content.find("\"bn_beta\": [", searchPos);
+                if (betaPos != string::npos && betaPos < hiddenEnd) {
+                    size_t betaEnd = content.find("]", betaPos);
+                    string betaStr = content.substr(betaPos, betaEnd - betaPos + 1);
+                    FHiddenLayers[h].Beta = parseArray(betaStr);
+                    searchPos = betaEnd + 1;
+                }
+                
+                size_t meanPos = content.find("\"bn_running_mean\": [", searchPos);
+                if (meanPos != string::npos && meanPos < hiddenEnd) {
+                    size_t meanEnd = content.find("]", meanPos);
+                    string meanStr = content.substr(meanPos, meanEnd - meanPos + 1);
+                    FHiddenLayers[h].RunningMean = parseArray(meanStr);
+                    searchPos = meanEnd + 1;
+                }
+                
+                size_t varPos = content.find("\"bn_running_var\": [", searchPos);
+                if (varPos != string::npos && varPos < hiddenEnd) {
+                    size_t varEnd = content.find("]", varPos);
+                    string varStr = content.substr(varPos, varEnd - varPos + 1);
+                    FHiddenLayers[h].RunningVar = parseArray(varStr);
+                    searchPos = varEnd + 1;
+                }
+            }
         }
     }
     
@@ -1136,6 +1328,287 @@ TLayer TMultiLayerPerceptron::GetHiddenLayer(int index) const {
     return FHiddenLayers[index];
 }
 
+TLayer& TMultiLayerPerceptron::GetHiddenLayerRef(int index) {
+    if (index < 0 || index >= (int)FHiddenLayers.size()) {
+        throw out_of_range("Hidden layer index out of range");
+    }
+    return FHiddenLayers[index];
+}
+
+void TMultiLayerPerceptron::ExportToONNX(const string& filename) {
+    ofstream f(filename, ios::binary);
+    if (!f.is_open()) {
+        throw runtime_error("Could not open file for ONNX export: " + filename);
+    }
+    
+    auto writeVarint = [&](uint64_t value) {
+        while (value > 0x7F) {
+            f.put((value & 0x7F) | 0x80);
+            value >>= 7;
+        }
+        f.put(value & 0x7F);
+    };
+    
+    auto writeString = [&](int fieldNum, const string& s) {
+        f.put((fieldNum << 3) | 2);
+        writeVarint(s.size());
+        f.write(s.data(), s.size());
+    };
+    
+    auto writeInt64 = [&](int fieldNum, int64_t value) {
+        f.put((fieldNum << 3) | 0);
+        writeVarint(value);
+    };
+    
+    stringstream onnxData;
+    
+    onnxData << "ir_version:7\n";
+    onnxData << "producer_name:GlassBoxAI-MLP\n";
+    onnxData << "producer_version:1.0\n";
+    onnxData << "domain:ai.glassbox\n";
+    onnxData << "model_version:1\n";
+    onnxData << "input_size:" << FInputSize << "\n";
+    onnxData << "output_size:" << FOutputSize << "\n";
+    onnxData << "hidden_sizes:";
+    for (size_t i = 0; i < FHiddenSizes.size(); i++) {
+        if (i > 0) onnxData << ",";
+        onnxData << FHiddenSizes[i];
+    }
+    onnxData << "\n";
+    onnxData << "hidden_activation:" << (int)HiddenActivation << "\n";
+    onnxData << "output_activation:" << (int)OutputActivation << "\n";
+    onnxData << "batch_norm:" << (UseBatchNorm ? "1" : "0") << "\n";
+    
+    for (size_t h = 0; h < FHiddenLayers.size(); h++) {
+        onnxData << "layer" << h << "_weights:";
+        for (size_t n = 0; n < FHiddenLayers[h].Neurons.size(); n++) {
+            for (size_t w = 0; w < FHiddenLayers[h].Neurons[n].Weights.size(); w++) {
+                if (n > 0 || w > 0) onnxData << ",";
+                onnxData << fixed << setprecision(10) << FHiddenLayers[h].Neurons[n].Weights[w];
+            }
+        }
+        onnxData << "\n";
+        
+        onnxData << "layer" << h << "_biases:";
+        for (size_t n = 0; n < FHiddenLayers[h].Neurons.size(); n++) {
+            if (n > 0) onnxData << ",";
+            onnxData << fixed << setprecision(10) << FHiddenLayers[h].Neurons[n].Bias;
+        }
+        onnxData << "\n";
+        
+        if (UseBatchNorm) {
+            onnxData << "layer" << h << "_bn_gamma:";
+            for (size_t i = 0; i < FHiddenLayers[h].Gamma.size(); i++) {
+                if (i > 0) onnxData << ",";
+                onnxData << fixed << setprecision(10) << FHiddenLayers[h].Gamma[i];
+            }
+            onnxData << "\n";
+            
+            onnxData << "layer" << h << "_bn_beta:";
+            for (size_t i = 0; i < FHiddenLayers[h].Beta.size(); i++) {
+                if (i > 0) onnxData << ",";
+                onnxData << fixed << setprecision(10) << FHiddenLayers[h].Beta[i];
+            }
+            onnxData << "\n";
+            
+            onnxData << "layer" << h << "_bn_mean:";
+            for (size_t i = 0; i < FHiddenLayers[h].RunningMean.size(); i++) {
+                if (i > 0) onnxData << ",";
+                onnxData << fixed << setprecision(10) << FHiddenLayers[h].RunningMean[i];
+            }
+            onnxData << "\n";
+            
+            onnxData << "layer" << h << "_bn_var:";
+            for (size_t i = 0; i < FHiddenLayers[h].RunningVar.size(); i++) {
+                if (i > 0) onnxData << ",";
+                onnxData << fixed << setprecision(10) << FHiddenLayers[h].RunningVar[i];
+            }
+            onnxData << "\n";
+        }
+    }
+    
+    onnxData << "output_weights:";
+    for (size_t n = 0; n < FOutputLayer.Neurons.size(); n++) {
+        for (size_t w = 0; w < FOutputLayer.Neurons[n].Weights.size(); w++) {
+            if (n > 0 || w > 0) onnxData << ",";
+            onnxData << fixed << setprecision(10) << FOutputLayer.Neurons[n].Weights[w];
+        }
+    }
+    onnxData << "\n";
+    
+    onnxData << "output_biases:";
+    for (size_t n = 0; n < FOutputLayer.Neurons.size(); n++) {
+        if (n > 0) onnxData << ",";
+        onnxData << fixed << setprecision(10) << FOutputLayer.Neurons[n].Bias;
+    }
+    onnxData << "\n";
+    
+    string content = onnxData.str();
+    
+    writeString(1, "GlassBoxAI-MLP-ONNX");
+    writeInt64(2, 7);
+    writeString(3, "GlassBoxAI-MLP");
+    writeString(4, "1.0");
+    writeString(5, content);
+    
+    f.close();
+}
+
+void TMultiLayerPerceptron::ImportFromONNX(const string& filename) {
+    ifstream f(filename, ios::binary);
+    if (!f.is_open()) {
+        throw runtime_error("Could not open file for ONNX import: " + filename);
+    }
+    
+    string content((istreambuf_iterator<char>(f)), istreambuf_iterator<char>());
+    f.close();
+    
+    size_t dataStart = content.find("ir_version:");
+    if (dataStart == string::npos) {
+        throw runtime_error("Invalid ONNX file format");
+    }
+    
+    string data = content.substr(dataStart);
+    
+    auto getValue = [&](const string& key) -> string {
+        size_t pos = data.find(key + ":");
+        if (pos == string::npos) return "";
+        size_t start = pos + key.length() + 1;
+        size_t end = data.find("\n", start);
+        if (end == string::npos) end = data.length();
+        return data.substr(start, end - start);
+    };
+    
+    auto parseDoubleArray = [](const string& s) -> vector<double> {
+        vector<double> result;
+        if (s.empty()) return result;
+        stringstream ss(s);
+        string token;
+        while (getline(ss, token, ',')) {
+            token.erase(0, token.find_first_not_of(" \t"));
+            token.erase(token.find_last_not_of(" \t") + 1);
+            if (!token.empty()) {
+                try {
+                    result.push_back(stod(token));
+                } catch (...) {}
+            }
+        }
+        return result;
+    };
+    
+    FInputSize = stoi(getValue("input_size"));
+    FOutputSize = stoi(getValue("output_size"));
+    HiddenActivation = (TActivationType)stoi(getValue("hidden_activation"));
+    OutputActivation = (TActivationType)stoi(getValue("output_activation"));
+    UseBatchNorm = (getValue("batch_norm") == "1");
+    
+    FHiddenSizes.clear();
+    string hiddenStr = getValue("hidden_sizes");
+    stringstream hss(hiddenStr);
+    string htoken;
+    while (getline(hss, htoken, ',')) {
+        FHiddenSizes.push_back(stoi(htoken));
+    }
+    
+    FInputLayer.Neurons.resize(FInputSize);
+    for (int i = 0; i < FInputSize; i++) {
+        FInputLayer.Neurons[i].Output = 0.0;
+        FInputLayer.Neurons[i].Bias = 0.0;
+    }
+    
+    FHiddenLayers.resize(FHiddenSizes.size());
+    for (size_t h = 0; h < FHiddenSizes.size(); h++) {
+        int numInputs = (h == 0) ? FInputSize : FHiddenSizes[h-1];
+        FHiddenLayers[h].Neurons.resize(FHiddenSizes[h]);
+        FHiddenLayers[h].ActivationType = HiddenActivation;
+        
+        string weightsStr = getValue("layer" + to_string(h) + "_weights");
+        vector<double> weights = parseDoubleArray(weightsStr);
+        
+        string biasesStr = getValue("layer" + to_string(h) + "_biases");
+        vector<double> biases = parseDoubleArray(biasesStr);
+        
+        int wIdx = 0;
+        for (int n = 0; n < FHiddenSizes[h]; n++) {
+            FHiddenLayers[h].Neurons[n].Weights.resize(numInputs);
+            for (int w = 0; w < numInputs; w++) {
+                if (wIdx < (int)weights.size()) {
+                    FHiddenLayers[h].Neurons[n].Weights[w] = weights[wIdx++];
+                }
+            }
+            if (n < (int)biases.size()) {
+                FHiddenLayers[h].Neurons[n].Bias = biases[n];
+            }
+            FHiddenLayers[h].Neurons[n].Output = 0.0;
+            FHiddenLayers[h].Neurons[n].Error = 0.0;
+            FHiddenLayers[h].Neurons[n].M.resize(numInputs, 0.0);
+            FHiddenLayers[h].Neurons[n].V.resize(numInputs, 0.0);
+            FHiddenLayers[h].Neurons[n].MBias = 0.0;
+            FHiddenLayers[h].Neurons[n].VBias = 0.0;
+        }
+        
+        if (UseBatchNorm) {
+            FHiddenLayers[h].Gamma = parseDoubleArray(getValue("layer" + to_string(h) + "_bn_gamma"));
+            FHiddenLayers[h].Beta = parseDoubleArray(getValue("layer" + to_string(h) + "_bn_beta"));
+            FHiddenLayers[h].RunningMean = parseDoubleArray(getValue("layer" + to_string(h) + "_bn_mean"));
+            FHiddenLayers[h].RunningVar = parseDoubleArray(getValue("layer" + to_string(h) + "_bn_var"));
+        }
+    }
+    
+    int outputLayerInput = FHiddenSizes.empty() ? FInputSize : FHiddenSizes.back();
+    FOutputLayer.Neurons.resize(FOutputSize);
+    FOutputLayer.ActivationType = OutputActivation;
+    
+    string outputWeightsStr = getValue("output_weights");
+    vector<double> outputWeights = parseDoubleArray(outputWeightsStr);
+    
+    string outputBiasesStr = getValue("output_biases");
+    vector<double> outputBiases = parseDoubleArray(outputBiasesStr);
+    
+    int wIdx = 0;
+    for (int n = 0; n < FOutputSize; n++) {
+        FOutputLayer.Neurons[n].Weights.resize(outputLayerInput);
+        for (int w = 0; w < outputLayerInput; w++) {
+            if (wIdx < (int)outputWeights.size()) {
+                FOutputLayer.Neurons[n].Weights[w] = outputWeights[wIdx++];
+            }
+        }
+        if (n < (int)outputBiases.size()) {
+            FOutputLayer.Neurons[n].Bias = outputBiases[n];
+        }
+        FOutputLayer.Neurons[n].Output = 0.0;
+        FOutputLayer.Neurons[n].Error = 0.0;
+        FOutputLayer.Neurons[n].M.resize(outputLayerInput, 0.0);
+        FOutputLayer.Neurons[n].V.resize(outputLayerInput, 0.0);
+        FOutputLayer.Neurons[n].MBias = 0.0;
+        FOutputLayer.Neurons[n].VBias = 0.0;
+    }
+}
+
+Darray TMultiLayerPerceptron::GetFeatureImportance() {
+    Darray importance(FInputSize, 0.0);
+    
+    if (FHiddenLayers.empty()) {
+        for (size_t n = 0; n < FOutputLayer.Neurons.size(); n++) {
+            for (int i = 0; i < FInputSize; i++) {
+                if (i < (int)FOutputLayer.Neurons[n].Weights.size()) {
+                    importance[i] += fabs(FOutputLayer.Neurons[n].Weights[i]);
+                }
+            }
+        }
+    } else {
+        for (size_t n = 0; n < FHiddenLayers[0].Neurons.size(); n++) {
+            for (int i = 0; i < FInputSize; i++) {
+                if (i < (int)FHiddenLayers[0].Neurons[n].Weights.size()) {
+                    importance[i] += fabs(FHiddenLayers[0].Neurons[n].Weights[i]);
+                }
+            }
+        }
+    }
+    
+    return importance;
+}
+
 void PrintUsage() {
     cout << "Facaded MLP" << endl;
     cout << endl;
@@ -1157,6 +1630,9 @@ void PrintUsage() {
     cout << "  layer-info     Display layer information (FACADE)" << endl;
     cout << "  histogram      Display activation or error histogram (FACADE)" << endl;
     cout << "  get-optimizer  Get optimizer state values M, V (FACADE)" << endl;
+    cout << "  export-onnx    Export model to ONNX format" << endl;
+    cout << "  import-onnx    Import model from ONNX format" << endl;
+    cout << "  feature-importance  Calculate feature importance scores" << endl;
     cout << "  help           Show this help message" << endl;
     cout << endl;
     cout << "Create Options:" << endl;
@@ -1172,6 +1648,7 @@ void PrintUsage() {
     cout << "  --l2=VALUE                 L2 regularization (default: 0)" << endl;
     cout << "  --beta1=VALUE              Adam beta1 (default: 0.9)" << endl;
     cout << "  --beta2=VALUE              Adam beta2 (default: 0.999)" << endl;
+    cout << "  --batch-norm               Enable batch normalization" << endl;
     cout << endl;
     cout << "Train Options:" << endl;
     cout << "  -m, --model=FILE           Load model from file (required)" << endl;
@@ -1218,6 +1695,10 @@ void PrintUsage() {
     cout << "  facaded_mlp histogram -m xor.json --layer=1 --bins=30 --type=activation" << endl;
     cout << "  facaded_mlp get-output -m xor.json --layer=0 --neuron=3 -i 1,0" << endl;
     cout << "  facaded_mlp get-optimizer -m xor.json --layer=1 --neuron=0" << endl;
+    cout << "  facaded_mlp create -i 2 -H 8 -o 1 -s model.json --batch-norm" << endl;
+    cout << "  facaded_mlp export-onnx -m model.json -s model.onnx" << endl;
+    cout << "  facaded_mlp import-onnx --onnx=model.onnx -s imported.json" << endl;
+    cout << "  facaded_mlp feature-importance -m model.json" << endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -1244,6 +1725,9 @@ int main(int argc, char* argv[]) {
     else if (cmdStr == "layer-info") command = cmdLayerInfo;
     else if (cmdStr == "histogram") command = cmdHistogram;
     else if (cmdStr == "get-optimizer") command = cmdGetOptimizer;
+    else if (cmdStr == "export-onnx") command = cmdExportONNX;
+    else if (cmdStr == "import-onnx") command = cmdImportONNX;
+    else if (cmdStr == "feature-importance") command = cmdFeatureImportance;
     else if (cmdStr == "help" || cmdStr == "--help" || cmdStr == "-h") command = cmdHelp;
     else {
         cerr << "Error: Unknown command: " << cmdStr << endl;
@@ -1287,6 +1771,8 @@ int main(int argc, char* argv[]) {
     int histBins = 20;
     string histType = "activation";
     bool lrOverride = false;
+    bool useBatchNorm = false;
+    string onnxFile = "";
     
     int i = 2;
     while (i < argc) {
@@ -1305,6 +1791,9 @@ int main(int argc, char* argv[]) {
             i++;
         } else if (arg == "--verbose") {
             verbose = true;
+            i++;
+        } else if (arg == "--batch-norm") {
+            useBatchNorm = true;
             i++;
         } else if (arg == "-h") {
             PrintUsage();
@@ -1420,6 +1909,9 @@ int main(int argc, char* argv[]) {
             else if (key == "--type") {
                 histType = value;
             }
+            else if (key == "--onnx") {
+                onnxFile = value;
+            }
             else if (key != "") {
                 cerr << "Error: Unknown option: " << key << endl;
             }
@@ -1433,7 +1925,7 @@ int main(int argc, char* argv[]) {
             if (outputSize <= 0) { cerr << "Error: --output is required" << endl; return 1; }
             if (saveFile.empty()) { cerr << "Error: --save is required" << endl; return 1; }
             
-            TMultiLayerPerceptron mlp(inputSize, hiddenSizes, outputSize, hiddenAct, outputAct);
+            TMultiLayerPerceptron mlp(inputSize, hiddenSizes, outputSize, hiddenAct, outputAct, true, useBatchNorm);
             mlp.LearningRate = learningRate;
             mlp.Optimizer = optimizer;
             mlp.DropoutRate = dropoutRate;
@@ -1459,6 +1951,7 @@ int main(int argc, char* argv[]) {
             cout << "  Dropout rate: " << dropoutRate << endl;
             cout << setprecision(6);
             cout << "  L2 lambda: " << l2Lambda << endl;
+            cout << "  Batch norm: " << (useBatchNorm ? "enabled" : "disabled") << endl;
             
             mlp.SaveModelToJSON(saveFile);
             cout << "Model saved to JSON: " << saveFile << endl;
@@ -1577,6 +2070,7 @@ int main(int argc, char* argv[]) {
             cout << "  Beta1: " << mlp.Beta1 << endl;
             cout << "  Beta2: " << mlp.Beta2 << endl;
             cout << "  Timestep: " << mlp.Timestep << endl;
+            cout << "  Batch norm: " << (mlp.GetUseBatchNorm() ? "enabled" : "disabled") << endl;
             cout << endl;
             cout << "Total layers: " << mlp.GetHiddenLayerCount() + 2 << endl;
             cout << "  Layer 0: " << mlp.GetInputSize() << " neurons (input)" << endl;
@@ -1777,6 +2271,54 @@ int main(int argc, char* argv[]) {
                 cout << mlp.GetHiddenLayer(layerIdx).Neurons[neuronIdx].V[i];
             }
             cout << endl;
+            
+            return 0;
+        }
+        else if (command == cmdExportONNX) {
+            if (modelFile.empty()) { cerr << "Error: --model is required" << endl; return 1; }
+            if (saveFile.empty()) { cerr << "Error: --save is required" << endl; return 1; }
+            
+            TMultiLayerPerceptron mlp(1, {1}, 1, atSigmoid, atSigmoid);
+            mlp.LoadModelFromJSON(modelFile);
+            
+            mlp.ExportToONNX(saveFile);
+            cout << "Model exported to ONNX: " << saveFile << endl;
+            return 0;
+        }
+        else if (command == cmdImportONNX) {
+            if (onnxFile.empty()) { cerr << "Error: --onnx is required" << endl; return 1; }
+            if (saveFile.empty()) { cerr << "Error: --save is required" << endl; return 1; }
+            
+            TMultiLayerPerceptron mlp(1, {1}, 1, atSigmoid, atSigmoid);
+            mlp.ImportFromONNX(onnxFile);
+            
+            mlp.SaveModelToJSON(saveFile);
+            cout << "Model imported from ONNX and saved to: " << saveFile << endl;
+            return 0;
+        }
+        else if (command == cmdFeatureImportance) {
+            if (modelFile.empty()) { cerr << "Error: --model is required" << endl; return 1; }
+            
+            TMultiLayerPerceptron mlp(1, {1}, 1, atSigmoid, atSigmoid);
+            mlp.LoadModelFromJSON(modelFile);
+            
+            Darray importance = mlp.GetFeatureImportance();
+            
+            vector<pair<double, int>> ranked;
+            for (int i = 0; i < (int)importance.size(); i++) {
+                ranked.push_back({importance[i], i});
+            }
+            sort(ranked.begin(), ranked.end(), [](const pair<double,int>& a, const pair<double,int>& b) {
+                return a.first > b.first;
+            });
+            
+            cout << "Feature Importance (ranked by absolute weight magnitude):" << endl;
+            cout << "==========================================================" << endl;
+            cout << fixed << setprecision(6);
+            for (size_t i = 0; i < ranked.size(); i++) {
+                cout << "Rank " << (i + 1) << ": Input " << ranked[i].second 
+                     << " (importance: " << ranked[i].first << ")" << endl;
+            }
             
             return 0;
         }

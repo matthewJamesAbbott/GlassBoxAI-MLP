@@ -39,11 +39,15 @@ This project demonstrates enterprise-grade software engineering practices includ
 6. [CLI Reference](#cli-reference)
    - [Standard MLP Commands](#standard-mlp-commands)
    - [Facade MLP Commands](#facade-mlp-commands)
-7. [Testing](#testing)
-8. [Formal Verification with Kani](#formal-verification-with-kani)
-9. [CISA/NSA Compliance](#cisansa-compliance)
-10. [License](#license)
-11. [Author](#author)
+7. [New Features (2025)](#new-features-2025)
+   - [Batch Normalization](#batch-normalization)
+   - [ONNX Export/Import](#onnx-exportimport)
+   - [Feature Importance](#feature-importance-glassbox-interpretability)
+8. [Testing](#testing)
+9. [Formal Verification with Kani](#formal-verification-with-kani)
+10. [CISA/NSA Compliance](#cisansa-compliance)
+11. [License](#license)
+12. [Author](#author)
 
 ---
 
@@ -57,8 +61,11 @@ This project demonstrates enterprise-grade software engineering practices includ
 | **Activation Functions** | Sigmoid, Tanh, ReLU, Softmax, Linear |
 | **Optimizers** | SGD, Adam, RMSProp with configurable hyperparameters |
 | **Regularization** | Dropout and L2 regularization |
+| **Batch Normalization** | Stabilize training with learnable scale/shift parameters |
 | **Training Features** | Learning rate decay, early stopping, batch training |
 | **Model Persistence** | JSON serialization for model save/load |
+| **ONNX Export/Import** | Interoperability with the global AI ecosystem |
+| **Feature Importance** | GlassBox interpretability - understand which inputs matter most |
 
 ### GPU Acceleration
 
@@ -262,6 +269,9 @@ mlp_opencl <command> [options]
 | `train` | Train the model with data |
 | `predict` | Make predictions with a model |
 | `info` | Display model information |
+| `export-onnx` | Export model to ONNX format for interoperability |
+| `import-onnx` | Import model from ONNX format |
+| `feature-importance` | Calculate and display input feature importance scores |
 | `help` | Show help message |
 
 #### Create Options
@@ -280,6 +290,7 @@ mlp_opencl <command> [options]
 | `--l2=VALUE` | L2 regularization lambda (default: 0) |
 | `--beta1=VALUE` | Adam beta1 parameter (default: 0.9) |
 | `--beta2=VALUE` | Adam beta2 parameter (default: 0.999) |
+| `--batch-norm` | Enable batch normalization for training stability |
 
 #### Train Options
 
@@ -306,6 +317,20 @@ mlp_opencl <command> [options]
 | `-m, --model=FILE` | Model file (required, .json) |
 | `-i, --input=v1,v2,...` | Input values, comma-separated (required) |
 
+#### Export/Import ONNX Options
+
+| Option | Description |
+|--------|-------------|
+| `-m, --model=FILE` | Model file to export (required for export-onnx) |
+| `-s, --save=FILE` | Output file (.onnx for export, .json for import) |
+| `--onnx=FILE` | ONNX file to import (required for import-onnx) |
+
+#### Feature Importance Options
+
+| Option | Description |
+|--------|-------------|
+| `-m, --model=FILE` | Model file to analyze (required) |
+
 #### Standard Examples
 
 ```bash
@@ -323,6 +348,18 @@ mlp predict -m xor_trained.json -i 1,0
 
 # Show model information
 mlp info -m xor_trained.json
+
+# Create with batch normalization
+mlp create --input=4 --hidden=64,32 --output=3 --batch-norm --save=bn_model.json
+
+# Export model to ONNX format
+mlp export-onnx -m xor_trained.json -s model.onnx
+
+# Import model from ONNX format
+mlp import-onnx --onnx=model.onnx -s imported_model.json
+
+# Calculate feature importance
+mlp feature-importance -m xor_trained.json
 ```
 
 ---
@@ -344,6 +381,9 @@ facaded_mlp_opencl <command> [options]
 | Command | Description |
 |---------|-------------|
 | `batch-predict` | Make predictions with a trained model (batch) |
+| `export-onnx` | Export model to ONNX format for interoperability |
+| `import-onnx` | Import model from ONNX format |
+| `feature-importance` | Calculate and display input feature importance (GlassBox) |
 | `get-weight` | Get a single weight value (FACADE) |
 | `set-weight` | Set a single weight value (FACADE) |
 | `get-weights` | Get all weights for a neuron (FACADE) |
@@ -365,6 +405,8 @@ facaded_mlp_opencl <command> [options]
 | `--value=V` | Value to set (required for set-* commands) |
 | `--bins=N` | Number of histogram bins (default: 20) |
 | `--type=TYPE` | Histogram type: activation\|error (default: activation) |
+| `--batch-norm` | Enable batch normalization (for create) |
+| `--onnx=FILE` | ONNX file path (for export/import-onnx) |
 
 #### Facade Examples
 
@@ -398,7 +440,87 @@ facaded_mlp get-output -m xor.json --layer=0 --neuron=3 -i 1,0
 
 # Get optimizer state
 facaded_mlp get-optimizer -m xor.json --layer=1 --neuron=0
+
+# Create with batch normalization
+facaded_mlp create -i 4 -H 16,8 -o 2 -s model.json --batch-norm
+
+# Export model to ONNX format
+facaded_mlp export-onnx -m xor_trained.json -s model.onnx
+
+# Import model from ONNX format
+facaded_mlp import-onnx --onnx=model.onnx -s imported.json
+
+# Calculate feature importance (GlassBox interpretability)
+facaded_mlp feature-importance -m xor_trained.json
 ```
+
+---
+
+## **New Features (2025)**
+
+### Batch Normalization
+
+Batch normalization stabilizes training by normalizing layer inputs, reducing internal covariate shift. This helps:
+
+- **Faster convergence** - Higher learning rates without divergence
+- **Better generalization** - Acts as a regularizer
+- **Reduced sensitivity** - Less dependent on weight initialization
+
+```bash
+# Enable batch normalization when creating a model
+mlp create -i 4 -H 64,32 -o 3 --batch-norm -s bn_model.json
+
+# Works across all implementations
+mlp_cuda create --input=10 --hidden=128,64 --output=5 --batch-norm --save=model.json
+facaded_mlp_opencl create -i 8 -H 32 -o 2 --batch-norm -s model.json
+```
+
+**Technical details:**
+- Momentum: 0.1 (running statistics update rate)
+- Epsilon: 1e-5 (numerical stability)
+- Training mode: Uses batch statistics
+- Inference mode: Uses running averages
+
+### ONNX Export/Import
+
+Export your trained models to ONNX format for use in:
+- **PyTorch** / **TensorFlow** / **ONNX Runtime**
+- **Mobile deployment** (iOS CoreML, Android NNAPI)
+- **Edge devices** (TensorRT, OpenVINO)
+- **Web browsers** (ONNX.js)
+
+```bash
+# Export a trained model to ONNX
+mlp export-onnx -m trained_model.json -s model.onnx
+
+# Import an ONNX model back to JSON
+mlp import-onnx --onnx=model.onnx -s imported_model.json
+```
+
+### Feature Importance (GlassBox Interpretability)
+
+True to the GlassBoxAI name, this feature provides model interpretability by calculating which input features have the greatest influence on predictions.
+
+```bash
+# Calculate feature importance
+mlp feature-importance -m trained_model.json
+```
+
+**Example output:**
+```
+Feature Importance Analysis
+===========================
+  Input 0:  34.52%  ████████████████████
+  Input 2:  28.17%  ████████████████
+  Input 1:  21.89%  ████████████
+  Input 3:  15.42%  █████████
+```
+
+**How it works:**
+- Sums absolute weight magnitudes from the first hidden layer for each input
+- Higher magnitude = more influence on hidden layer activations
+- Normalized to percentages for easy comparison
+- Competes with scikit-learn's interpretability tools
 
 ---
 

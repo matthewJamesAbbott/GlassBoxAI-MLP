@@ -51,6 +51,14 @@ pub struct LayerDataCUDA {
     pub NumNeurons: i32,
     pub NumInputs: i32,
     pub ActivationType: TActivationType,
+    pub d_Gamma: CudaSlice<f64>,
+    pub d_Beta: CudaSlice<f64>,
+    pub d_RunningMean: CudaSlice<f64>,
+    pub d_RunningVar: CudaSlice<f64>,
+    pub d_BatchMean: CudaSlice<f64>,
+    pub d_BatchVar: CudaSlice<f64>,
+    pub d_dGamma: CudaSlice<f64>,
+    pub d_dBeta: CudaSlice<f64>,
 }
 
 pub fn ActivationToStr(act: TActivationType) -> &'static str {
@@ -149,6 +157,8 @@ struct ModelJSON {
     input_layer: InputLayerJSON,
     hidden_layers: Vec<HiddenLayerJSON>,
     output_layer: OutputLayerJSON,
+    #[serde(default)]
+    batch_norm: bool,
 }
 
 pub struct TMultiLayerPerceptronCUDA {
@@ -180,6 +190,9 @@ pub struct TMultiLayerPerceptronCUDA {
     pub LRDecayEpochs: i32,
     pub EnableEarlyStopping: bool,
     pub EarlyStoppingPatience: i32,
+    pub UseBatchNorm: bool,
+    pub BNMomentum: f64,
+    pub BNEpsilon: f64,
 }
 
 impl TMultiLayerPerceptronCUDA {
@@ -245,6 +258,9 @@ impl TMultiLayerPerceptronCUDA {
             LRDecayEpochs: 10,
             EnableEarlyStopping: false,
             EarlyStoppingPatience: 10,
+            UseBatchNorm: false,
+            BNMomentum: 0.1,
+            BNEpsilon: 1e-5,
         })
     }
 
@@ -281,6 +297,14 @@ impl TMultiLayerPerceptronCUDA {
             NumNeurons: num_neurons,
             NumInputs: num_inputs,
             ActivationType: act_type,
+            d_Gamma: dev.htod_copy(vec![1.0f64; neuron_count])?,
+            d_Beta: dev.alloc_zeros::<f64>(neuron_count)?,
+            d_RunningMean: dev.alloc_zeros::<f64>(neuron_count)?,
+            d_RunningVar: dev.htod_copy(vec![1.0f64; neuron_count])?,
+            d_BatchMean: dev.alloc_zeros::<f64>(neuron_count)?,
+            d_BatchVar: dev.alloc_zeros::<f64>(neuron_count)?,
+            d_dGamma: dev.alloc_zeros::<f64>(neuron_count)?,
+            d_dBeta: dev.alloc_zeros::<f64>(neuron_count)?,
         })
     }
 
@@ -687,6 +711,7 @@ impl TMultiLayerPerceptronCUDA {
             input_layer: InputLayerJSON { neuron_count: self.FInputSize },
             hidden_layers: hidden_layers_json,
             output_layer: OutputLayerJSON { neuron_count: self.FOutputSize, neurons: out_neurons, biases: out_biases },
+            batch_norm: self.UseBatchNorm,
         };
 
         let json = serde_json::to_string_pretty(&model).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -710,6 +735,7 @@ impl TMultiLayerPerceptronCUDA {
         mlp.L2Lambda = model.l2_lambda;
         mlp.Beta1 = model.beta1;
         mlp.Beta2 = model.beta2;
+        mlp.UseBatchNorm = model.batch_norm;
 
         for (h, hl) in model.hidden_layers.iter().enumerate() {
             let layer = &mlp.Layers[h + 1];
@@ -741,6 +767,320 @@ impl TMultiLayerPerceptronCUDA {
         mlp.Dev.htod_sync_copy_into(&h_biases, &mut mlp.Layers[num_layers - 1].Biases)?;
 
         Ok(mlp)
+    }
+
+    pub fn export_to_onnx(&self, filename: &str) -> io::Result<()> {
+        use crate::onnx::*;
+
+        let mut graph_inputs = Vec::new();
+        let mut graph_outputs = Vec::new();
+        let mut nodes = Vec::new();
+        let mut initializers = Vec::new();
+
+        graph_inputs.push(ValueInfoProto {
+            name: "input".to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: TensorProto::DOUBLE as i32,
+                    shape: Some(TensorShapeProto {
+                        dim: vec![
+                            tensor_shape_proto::Dimension { value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())), denotation: String::new() },
+                            tensor_shape_proto::Dimension { value: Some(tensor_shape_proto::dimension::Value::DimValue(self.FInputSize as i64)), denotation: String::new() },
+                        ],
+                    }),
+                })),
+                denotation: String::new(),
+            }),
+            doc_string: String::new(),
+        });
+
+        let num_layers = self.NumLayers as usize;
+        let mut prev_output = "input".to_string();
+
+        for k in 1..num_layers {
+            let layer = &self.Layers[k];
+            let layer_name = format!("layer_{}", k);
+
+            let h_weights = self.Dev.dtoh_sync_copy(&layer.Weights).unwrap();
+            let h_biases = self.Dev.dtoh_sync_copy(&layer.Biases).unwrap();
+
+            let internal_num_neurons = layer.NumNeurons as usize;
+            let internal_num_inputs = layer.NumInputs as usize;
+
+            let is_hidden = k < num_layers - 1;
+            let onnx_num_outputs = if is_hidden {
+                self.FHiddenSizes[k - 1] as usize
+            } else {
+                self.FOutputSize as usize
+            };
+            let onnx_num_inputs = if k == 1 {
+                self.FInputSize as usize
+            } else {
+                self.FHiddenSizes[k - 2] as usize
+            };
+
+            let mut onnx_weights = vec![0.0f64; onnx_num_outputs * onnx_num_inputs];
+            for i in 0..onnx_num_outputs.min(internal_num_neurons) {
+                for j in 0..onnx_num_inputs.min(internal_num_inputs) {
+                    onnx_weights[i * onnx_num_inputs + j] = h_weights[i * internal_num_inputs + j];
+                }
+            }
+
+            let onnx_biases: Vec<f64> = h_biases.iter().take(onnx_num_outputs).cloned().collect();
+
+            let weight_name = format!("{}_weight", layer_name);
+            let bias_name = format!("{}_bias", layer_name);
+            let matmul_out = format!("{}_matmul", layer_name);
+            let add_out = format!("{}_add", layer_name);
+            let act_out = format!("{}_out", layer_name);
+
+            initializers.push(TensorProto {
+                dims: vec![onnx_num_outputs as i64, onnx_num_inputs as i64],
+                data_type: TensorProto::DOUBLE as i32,
+                double_data: onnx_weights,
+                name: weight_name.clone(),
+                ..Default::default()
+            });
+
+            initializers.push(TensorProto {
+                dims: vec![onnx_num_outputs as i64],
+                data_type: TensorProto::DOUBLE as i32,
+                double_data: onnx_biases,
+                name: bias_name.clone(),
+                ..Default::default()
+            });
+
+            nodes.push(NodeProto {
+                input: vec![prev_output.clone(), weight_name],
+                output: vec![matmul_out.clone()],
+                name: format!("{}_gemm", layer_name),
+                op_type: "Gemm".to_string(),
+                attribute: vec![
+                    AttributeProto { name: "transB".to_string(), r#type: AttributeProto::INT as i32, i: 1, ..Default::default() },
+                ],
+                ..Default::default()
+            });
+
+            nodes.push(NodeProto {
+                input: vec![matmul_out, bias_name],
+                output: vec![add_out.clone()],
+                name: format!("{}_add", layer_name),
+                op_type: "Add".to_string(),
+                ..Default::default()
+            });
+
+            let act_type = layer.ActivationType;
+            let (op_type, final_out) = if k == num_layers - 1 && act_type == TActivationType::atSoftmax {
+                ("Softmax", act_out.clone())
+            } else {
+                match act_type {
+                    TActivationType::atSigmoid => ("Sigmoid", act_out.clone()),
+                    TActivationType::atTanh => ("Tanh", act_out.clone()),
+                    TActivationType::atReLU => ("Relu", act_out.clone()),
+                    TActivationType::atSoftmax => ("Softmax", act_out.clone()),
+                }
+            };
+
+            nodes.push(NodeProto {
+                input: vec![add_out],
+                output: vec![final_out.clone()],
+                name: format!("{}_{}", layer_name, op_type.to_lowercase()),
+                op_type: op_type.to_string(),
+                ..Default::default()
+            });
+
+            prev_output = final_out;
+        }
+
+        graph_outputs.push(ValueInfoProto {
+            name: prev_output.clone(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: TensorProto::DOUBLE as i32,
+                    shape: Some(TensorShapeProto {
+                        dim: vec![
+                            tensor_shape_proto::Dimension { value: Some(tensor_shape_proto::dimension::Value::DimParam("batch".to_string())), denotation: String::new() },
+                            tensor_shape_proto::Dimension { value: Some(tensor_shape_proto::dimension::Value::DimValue(self.FOutputSize as i64)), denotation: String::new() },
+                        ],
+                    }),
+                })),
+                denotation: String::new(),
+            }),
+            doc_string: String::new(),
+        });
+
+        let graph = GraphProto {
+            name: "mlp".to_string(),
+            node: nodes,
+            input: graph_inputs,
+            output: graph_outputs,
+            initializer: initializers,
+            ..Default::default()
+        };
+
+        let model = ModelProto {
+            ir_version: 8,
+            opset_import: vec![OperatorSetIdProto { domain: String::new(), version: 13 }],
+            producer_name: "facaded_mlp_cuda".to_string(),
+            producer_version: "1.0.0".to_string(),
+            graph: Some(graph),
+            ..Default::default()
+        };
+
+        use prost::Message;
+        let mut buf = Vec::new();
+        model.encode(&mut buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut file = File::create(filename)?;
+        file.write_all(&buf)?;
+        Ok(())
+    }
+
+    pub fn import_from_onnx(filename: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        use crate::onnx::*;
+        use prost::Message;
+
+        let data = std::fs::read(filename)?;
+        let model = ModelProto::decode(&data[..])?;
+        let graph = model.graph.ok_or("No graph in ONNX model")?;
+
+        let mut layer_weights: Vec<(Vec<f64>, Vec<f64>, i32, i32, TActivationType)> = Vec::new();
+        let mut initializer_map: std::collections::HashMap<String, &TensorProto> = std::collections::HashMap::new();
+
+        for init in &graph.initializer {
+            initializer_map.insert(init.name.clone(), init);
+        }
+
+        let mut input_size = 0i32;
+        if let Some(input_info) = graph.input.first() {
+            if let Some(ref type_proto) = input_info.r#type {
+                if let Some(type_proto::Value::TensorType(ref tensor)) = type_proto.value {
+                    if let Some(ref shape) = tensor.shape {
+                        if shape.dim.len() >= 2 {
+                            if let Some(tensor_shape_proto::dimension::Value::DimValue(v)) = &shape.dim[1].value {
+                                input_size = *v as i32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut gemm_nodes: Vec<&NodeProto> = Vec::new();
+        let mut act_nodes: Vec<&NodeProto> = Vec::new();
+
+        for node in &graph.node {
+            match node.op_type.as_str() {
+                "Gemm" | "MatMul" => gemm_nodes.push(node),
+                "Sigmoid" | "Tanh" | "Relu" | "Softmax" => act_nodes.push(node),
+                _ => {}
+            }
+        }
+
+        for (i, gemm) in gemm_nodes.iter().enumerate() {
+            let weight_name = &gemm.input[1];
+            let weight_tensor = initializer_map.get(weight_name).ok_or("Missing weight tensor")?;
+
+            let dims = &weight_tensor.dims;
+            let num_outputs = dims[0] as i32;
+            let num_inputs = dims[1] as i32;
+
+            let weights = weight_tensor.double_data.clone();
+            let bias_name = gemm.input.get(2).cloned().unwrap_or_default();
+            let biases = if let Some(bias_tensor) = initializer_map.get(&bias_name) {
+                bias_tensor.double_data.clone()
+            } else {
+                let add_node = graph.node.iter().find(|n| n.op_type == "Add" && n.input.iter().any(|inp| inp.contains(&gemm.output[0])));
+                if let Some(add) = add_node {
+                    let bias_input = add.input.iter().find(|inp| initializer_map.contains_key(*inp));
+                    if let Some(bi) = bias_input {
+                        initializer_map.get(bi).map(|t| t.double_data.clone()).unwrap_or_else(|| vec![0.0; num_outputs as usize])
+                    } else {
+                        vec![0.0; num_outputs as usize]
+                    }
+                } else {
+                    vec![0.0; num_outputs as usize]
+                }
+            };
+
+            let act_type = if i < act_nodes.len() {
+                match act_nodes[i].op_type.as_str() {
+                    "Sigmoid" => TActivationType::atSigmoid,
+                    "Tanh" => TActivationType::atTanh,
+                    "Relu" => TActivationType::atReLU,
+                    "Softmax" => TActivationType::atSoftmax,
+                    _ => TActivationType::atSigmoid,
+                }
+            } else {
+                TActivationType::atSigmoid
+            };
+
+            layer_weights.push((weights, biases, num_inputs, num_outputs, act_type));
+        }
+
+        if layer_weights.is_empty() {
+            return Err("No layers found in ONNX model".into());
+        }
+
+        let output_size = layer_weights.last().unwrap().3;
+        let hidden_sizes: Vec<i32> = layer_weights.iter().take(layer_weights.len() - 1).map(|l| l.3).collect();
+        let hidden_act = if !layer_weights.is_empty() { layer_weights[0].4 } else { TActivationType::atSigmoid };
+        let output_act = layer_weights.last().map(|l| l.4).unwrap_or(TActivationType::atSigmoid);
+
+        let mut mlp = Self::new(input_size, &hidden_sizes, output_size, hidden_act, output_act)?;
+
+        for (i, (weights, biases, onnx_num_inputs, onnx_num_outputs, _act)) in layer_weights.iter().enumerate() {
+            let layer_idx = i + 1;
+            if layer_idx < mlp.Layers.len() {
+                let layer = &mlp.Layers[layer_idx];
+                let internal_num_inputs = layer.NumInputs as usize;
+                let internal_num_neurons = layer.NumNeurons as usize;
+                let onnx_inputs = *onnx_num_inputs as usize;
+                let onnx_outputs = *onnx_num_outputs as usize;
+
+                let mut padded_weights = vec![0.0f64; internal_num_neurons * internal_num_inputs];
+                for n in 0..onnx_outputs.min(internal_num_neurons) {
+                    for w in 0..onnx_inputs.min(internal_num_inputs) {
+                        padded_weights[n * internal_num_inputs + w] = weights[n * onnx_inputs + w];
+                    }
+                }
+
+                let mut padded_biases = vec![0.0f64; internal_num_neurons];
+                for n in 0..biases.len().min(internal_num_neurons) {
+                    padded_biases[n] = biases[n];
+                }
+
+                mlp.Dev.htod_sync_copy_into(&padded_weights, &mut mlp.Layers[layer_idx].Weights)?;
+                mlp.Dev.htod_sync_copy_into(&padded_biases, &mut mlp.Layers[layer_idx].Biases)?;
+            }
+        }
+
+        Ok(mlp)
+    }
+
+    pub fn compute_feature_importance(&self) -> Vec<(usize, f64)> {
+        if self.NumLayers < 2 {
+            return vec![];
+        }
+
+        let first_hidden_layer = &self.Layers[1];
+        let weights = self.Dev.dtoh_sync_copy(&first_hidden_layer.Weights).unwrap();
+        let num_neurons = first_hidden_layer.NumNeurons as usize;
+        let num_inputs = first_hidden_layer.NumInputs as usize;
+
+        let mut importance: Vec<(usize, f64)> = Vec::with_capacity(self.FInputSize as usize);
+
+        for input_idx in 0..self.FInputSize as usize {
+            let mut sum = 0.0;
+            for neuron_idx in 0..num_neurons {
+                if input_idx < num_inputs {
+                    sum += weights[neuron_idx * num_inputs + input_idx].abs();
+                }
+            }
+            importance.push((input_idx, sum));
+        }
+
+        importance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        importance
     }
 }
 

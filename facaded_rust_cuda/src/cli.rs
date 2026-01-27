@@ -9,6 +9,7 @@ pub enum TCommand {
     CmdGetWeight, CmdSetWeight, CmdGetBias, CmdSetBias,
     CmdGetOutput, CmdGetError, CmdLayerInfo, CmdHistogram,
     CmdGetOptimizer, CmdGetWeights, CmdGetAllOutputs, CmdBatchPredict,
+    CmdExportONNX, CmdImportONNX, CmdFeatureImportance,
 }
 
 fn PrintUsage() {
@@ -17,22 +18,25 @@ fn PrintUsage() {
     println!("Usage: facaded_mlp <command> [options]");
     println!();
     println!("Commands:");
-    println!("  create         Create a new MLP model");
-    println!("  train          Train an existing model with data");
-    println!("  predict        Make predictions with a trained model");
-    println!("  batch-predict  Make predictions with a trained model (batch)");
-    println!("  info           Display model information");
-    println!("  get-weight     Get a single weight value (FACADE)");
-    println!("  set-weight     Set a single weight value (FACADE)");
-    println!("  get-weights    Get all weights for a neuron (FACADE)");
-    println!("  get-bias       Get bias value for a neuron (FACADE)");
-    println!("  set-bias       Set bias value for a neuron (FACADE)");
-    println!("  get-output     Get neuron output value (FACADE)");
-    println!("  get-error      Get neuron error value (FACADE)");
-    println!("  layer-info     Display layer information (FACADE)");
-    println!("  histogram      Display activation or error histogram (FACADE)");
-    println!("  get-optimizer  Get optimizer state values M, V (FACADE)");
-    println!("  help           Show this help message");
+    println!("  create            Create a new MLP model");
+    println!("  train             Train an existing model with data");
+    println!("  predict           Make predictions with a trained model");
+    println!("  batch-predict     Make predictions with a trained model (batch)");
+    println!("  info              Display model information");
+    println!("  export-onnx       Export model to ONNX format");
+    println!("  import-onnx       Import model from ONNX format");
+    println!("  feature-importance Compute and display feature importance");
+    println!("  get-weight        Get a single weight value (FACADE)");
+    println!("  set-weight        Set a single weight value (FACADE)");
+    println!("  get-weights       Get all weights for a neuron (FACADE)");
+    println!("  get-bias          Get bias value for a neuron (FACADE)");
+    println!("  set-bias          Set bias value for a neuron (FACADE)");
+    println!("  get-output        Get neuron output value (FACADE)");
+    println!("  get-error         Get neuron error value (FACADE)");
+    println!("  layer-info        Display layer information (FACADE)");
+    println!("  histogram         Display activation or error histogram (FACADE)");
+    println!("  get-optimizer     Get optimizer state values M, V (FACADE)");
+    println!("  help              Show this help message");
     println!();
     println!("Create Options:");
     println!("  -i, --input=N              Input layer size (required)");
@@ -47,6 +51,7 @@ fn PrintUsage() {
     println!("  --l2=VALUE                 L2 regularization (default: 0)");
     println!("  --beta1=VALUE              Adam beta1 (default: 0.9)");
     println!("  --beta2=VALUE              Adam beta2 (default: 0.999)");
+    println!("  --batch-norm               Enable batch normalization");
     println!();
     println!("Train Options:");
     println!("  -m, --model=FILE           Load model from file (required)");
@@ -81,6 +86,14 @@ fn PrintUsage() {
     println!("  --type=TYPE                Histogram type: activation|error (default: activation)");
     println!("  -i, --input=v1,v2,...      Input values for get-output command");
     println!();
+    println!("ONNX Options:");
+    println!("  -m, --model=FILE           Model file (required for export)");
+    println!("  --onnx=FILE                ONNX file path (required)");
+    println!("  -s, --save=FILE            Save imported model to file (required for import)");
+    println!();
+    println!("Feature Importance Options:");
+    println!("  -m, --model=FILE           Model file (required)");
+    println!();
     println!("Examples:");
     println!("  facaded_mlp create -i 2 -H 8 -o 1 -s xor.json");
     println!("  facaded_mlp train -m xor.json -d data.csv -s xor_trained.json --epochs=1000");
@@ -93,6 +106,10 @@ fn PrintUsage() {
     println!("  facaded_mlp histogram -m xor.json --layer=1 --bins=30 --type=activation");
     println!("  facaded_mlp get-output -m xor.json --layer=0 --neuron=3 -i 1,0");
     println!("  facaded_mlp get-optimizer -m xor.json --layer=1 --neuron=0");
+    println!("  facaded_mlp export-onnx -m xor.json --onnx=xor.onnx");
+    println!("  facaded_mlp import-onnx --onnx=xor.onnx -s xor_imported.json");
+    println!("  facaded_mlp feature-importance -m xor.json");
+    println!("  facaded_mlp create -i 2 -H 8 -o 1 -s xor.json --batch-norm");
 }
 
 pub fn run() {
@@ -122,6 +139,9 @@ pub fn run() {
         "layer-info" => TCommand::CmdLayerInfo,
         "histogram" => TCommand::CmdHistogram,
         "get-optimizer" => TCommand::CmdGetOptimizer,
+        "export-onnx" => TCommand::CmdExportONNX,
+        "import-onnx" => TCommand::CmdImportONNX,
+        "feature-importance" => TCommand::CmdFeatureImportance,
         _ => {
             eprintln!("Unknown command: {}", cmd_str);
             PrintUsage();
@@ -167,6 +187,8 @@ pub fn run() {
     let mut histogram_type = String::from("activation");
     let mut histogram_bins: usize = 20;
     let mut run_input: Darray = Vec::new();
+    let mut batch_norm = false;
+    let mut onnx_file = String::new();
 
     for i in 2..args.len() {
         let arg = &args[i];
@@ -174,6 +196,7 @@ pub fn run() {
         if arg == "--early-stop" { early_stop = true; continue; }
         if arg == "--normalize" { normalize = true; continue; }
         if arg == "--verbose" { verbose = true; continue; }
+        if arg == "--batch-norm" { batch_norm = true; continue; }
 
         if let Some(eq) = arg.find('=') {
             let key = &arg[..eq];
@@ -208,6 +231,7 @@ pub fn run() {
                 "--type" => histogram_type = value.to_string(),
                 "--bins" => histogram_bins = value.parse().unwrap_or(20),
                 "--run-input" => run_input = ParseDoubleArray(value),
+                "--onnx" => onnx_file = value.to_string(),
                 _ => eprintln!("Unknown option: {}", key),
             }
         }
@@ -229,6 +253,7 @@ pub fn run() {
             mlp.L2Lambda = l2_lambda;
             mlp.Beta1 = beta1;
             mlp.Beta2 = beta2;
+            mlp.UseBatchNorm = batch_norm;
             if let Err(e) = mlp.Save(&save_file) { eprintln!("Error: {}", e); process::exit(1); }
 
             println!("Created MLP model (CUDA/Rust):");
@@ -239,6 +264,7 @@ pub fn run() {
             println!("  Output activation: {}", ActivationToStr(output_act));
             println!("  Optimizer: {}", OptimizerToStr(optimizer));
             println!("  Learning rate: {:.4}", learning_rate);
+            println!("  Batch normalization: {}", batch_norm);
             println!("  Saved to: {}", save_file);
         }
         TCommand::CmdTrain => {
@@ -338,6 +364,7 @@ pub fn run() {
             println!("  Beta1: {:.4}", mlp.Beta1);
             println!("  Beta2: {:.4}", mlp.Beta2);
             println!("  Timestep: {}", mlp.Timestep);
+            println!("  Batch normalization: {}", mlp.UseBatchNorm);
             println!();
             println!("Total layers: {}", mlp.GetNumLayers());
             for i in 0..mlp.GetNumLayers() as usize { println!("  Layer {}: {} neurons", i, mlp.GetLayerSize(i)); }
@@ -501,6 +528,46 @@ pub fn run() {
                     println!("    [{}] M={:.6} V={:.6}", w, mlp.GetWeightM(layer_idx, neuron_idx, w), mlp.GetWeightV(layer_idx, neuron_idx, w));
                 }
                 if num_weights > 10 { println!("    ... ({} more)", num_weights - 10); }
+            }
+        }
+        TCommand::CmdExportONNX => {
+            if model_file.is_empty() { eprintln!("Error: --model is required"); process::exit(1); }
+            if onnx_file.is_empty() { eprintln!("Error: --onnx is required"); process::exit(1); }
+            let mlp = match TMultiLayerPerceptronCUDA::Load(&model_file) {
+                Ok(m) => m, Err(e) => { eprintln!("Error: {}", e); process::exit(1); }
+            };
+            if let Err(e) = mlp.export_to_onnx(&onnx_file) {
+                eprintln!("Error exporting to ONNX: {}", e);
+                process::exit(1);
+            }
+            println!("Exported model to ONNX: {}", onnx_file);
+        }
+        TCommand::CmdImportONNX => {
+            if onnx_file.is_empty() { eprintln!("Error: --onnx is required"); process::exit(1); }
+            if save_file.is_empty() { eprintln!("Error: --save is required"); process::exit(1); }
+            let mlp = match TMultiLayerPerceptronCUDA::import_from_onnx(&onnx_file) {
+                Ok(m) => m, Err(e) => { eprintln!("Error importing from ONNX: {}", e); process::exit(1); }
+            };
+            if let Err(e) = mlp.Save(&save_file) {
+                eprintln!("Error saving model: {}", e);
+                process::exit(1);
+            }
+            println!("Imported ONNX model from: {}", onnx_file);
+            println!("Saved to: {}", save_file);
+            println!("  Input size: {}", mlp.GetInputSize());
+            print!("  Hidden sizes: "); for (i, &s) in mlp.GetHiddenSizes().iter().enumerate() { print!("{}{}", if i > 0 { "," } else { "" }, s); } println!();
+            println!("  Output size: {}", mlp.GetOutputSize());
+        }
+        TCommand::CmdFeatureImportance => {
+            if model_file.is_empty() { eprintln!("Error: --model is required"); process::exit(1); }
+            let mlp = match TMultiLayerPerceptronCUDA::Load(&model_file) {
+                Ok(m) => m, Err(e) => { eprintln!("Error: {}", e); process::exit(1); }
+            };
+            let importance = mlp.compute_feature_importance();
+            println!("Feature Importance (ranked by weight magnitude sum):");
+            println!("================================================");
+            for (rank, (feature_idx, score)) in importance.iter().enumerate() {
+                println!("  Rank {:2}: Feature {:3} -> Score: {:.6}", rank + 1, feature_idx, score);
             }
         }
         _ => {}
